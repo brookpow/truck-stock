@@ -17,9 +17,50 @@ Stock deduction, restock lists, warehouse pull lists, and POs come AFTER this
 works. None of them block GP.
 
 ## Endpoints (this build)
+- `GET  /api/techs` — tech roster for the name picker (reads crm_techs) — VERIFY columns
+- `GET  /api/techs/jobs?st_tech_id=` — today's jobs for a tech (ST-fed; PLACEHOLDER returns empty → app falls back to manual job-id entry)
 - `GET  /api/materials/search?q=elbow` — search-as-you-type over crm_materials
 - `POST /api/jobs/:jobId/materials` — log used material (freezes catalog cost)
 - `GET  /api/jobs/:jobId/materials` — list a job's logged materials + total
+
+## VERIFY before deploy — crm_techs columns
+The /api/techs endpoint assumes crm_techs has `id`, `name`, `st_tech_id`, and
+`is_active`. Confirm with:
+
+```
+npx wrangler d1 execute ad-attribution-db --remote --command \
+ "SELECT name FROM pragma_table_info('crm_techs');"
+```
+
+Fix the column names in `src/index.js` (the /api/techs query) to match. If the
+ServiceTitan tech id lives under a different column name, update both that query
+and the front-end's use of `st_tech_id`.
+
+## The tech mobile app (web/)
+A Vite + React mobile web app. Techs open it in a phone browser and "Add to Home
+Screen" — works identically on iPhone, iPad, Android, no app store needed.
+
+Flow: pick your name once (remembered on the device) → today's jobs (or manual
+ST job-number entry) → search materials → tap + to log. Each logged material
+POSTs to crm_job_materials with cost frozen, tied to the numeric job id and the
+tech's ST id.
+
+```bash
+cd web
+npm install
+echo 'VITE_API=https://truck-stock-worker.tiny-truth-e86a.workers.dev' > .env
+npm run dev        # local preview at localhost:5173
+npm run build      # production build -> dist/
+npx wrangler pages deploy dist --project-name=truck-stock --commit-dirty=true
+```
+
+### Why manual job entry is the safe default
+The "today's jobs" ServiceTitan pull is the one genuinely new/uncertain piece
+(needs ST appointment query tuned to your data). Until it's wired, the app falls
+back to entering the numeric ST job number by hand — fully usable today, and the
+numeric-only validation prevents the silent GP-miss bug (non-numeric job ids
+never match GP-tracker's join).
+
 
 ## Schema — confirmed
 This worker is written against the verified real schema:

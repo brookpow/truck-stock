@@ -24,7 +24,7 @@ const json = (data, status = 200) =>
 
 const cors = () => ({
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 });
 
@@ -35,6 +35,36 @@ export default {
     const p = url.pathname;
 
     try {
+      // --- 0a. Tech roster for the name picker ----------------------------
+      // Verified against the real crm_techs schema (PRAGMA table_info):
+      //   id, name, email, is_active, st_tech_id, ...
+      // st_tech_id is the ServiceTitan employee id (crm_st_employees.id),
+      // populated via migration 0001 by name match. It drives the per-plumber
+      // GP breakdown, so it's what the app attributes materials by. May be NULL
+      // for non-ServiceTitan techs (e.g. Office). Active flag is is_active.
+      // Pass ?all=1 to include inactive techs.
+      if (p === "/api/techs" && request.method === "GET") {
+        const includeInactive = url.searchParams.get("all") === "1";
+        const r = await env.DB.prepare(
+          `SELECT id, name, email, is_active, st_tech_id
+             FROM crm_techs
+            ${includeInactive ? "" : "WHERE is_active = 1"}
+            ORDER BY name`
+        ).all();
+        return json(r.results || []);
+      }
+
+      // --- 0b. Today's jobs for a tech (ServiceTitan-fed) -----------------
+      // PLACEHOLDER: the real version calls the ServiceTitan appointments API
+      // by st_tech_id for today. That requires ST secrets + the appointment
+      // query, which we tune against real data. For now this returns an empty
+      // list so the app falls back to manual job-id entry and stays usable.
+      if (p === "/api/techs/jobs" && request.method === "GET") {
+        // const stTechId = url.searchParams.get("st_tech_id");
+        // TODO: fetch ST appointments for stTechId, today, map to jobs.
+        return json({ jobs: [], fallback: "manual" });
+      }
+
       // --- 1. Search-as-you-type over the catalog -------------------------
       // Matches name, code, or EMCO SKU. Returns cost so the capture screen
       // can freeze it onto the job line at time of use.
@@ -100,16 +130,44 @@ export default {
       if (saveMatch && request.method === "GET") {
         const jobId = saveMatch[1];
         const r = await env.DB.prepare(
+          // tech_id stores the ServiceTitan id (st_tech_id), so the tech join
+          // is on t.st_tech_id, NOT t.id. tech_name is aliased to avoid
+          // colliding with m.name (the material name). Both joins are LEFT so
+          // a missing material or unmapped tech still returns the line.
           `SELECT jm.id, jm.material_id, jm.quantity, jm.unit_cost, jm.total_cost,
-                  jm.notes, jm.is_prepull, m.name, m.code, m.unit
+                  jm.notes, jm.is_prepull, jm.tech_id, m.name, m.code, m.unit,
+                  t.name AS tech_name
              FROM crm_job_materials jm
              LEFT JOIN crm_materials m ON m.id = jm.material_id
+             LEFT JOIN crm_techs t ON t.st_tech_id = jm.tech_id
             WHERE jm.job_id = ?
             ORDER BY jm.id DESC`
         ).bind(jobId).all();
         const rows = r.results || [];
         const total = rows.reduce((a, x) => a + (x.total_cost || 0), 0);
         return json({ job_id: jobId, items: rows, total_material_cost: total });
+      }
+
+      // --- 4. Delete a logged material line (hard delete) -----------------
+      // DELETE /api/jobs/:jobId/materials/:lineId
+      // Scope check is REQUIRED: we only delete when the row's job_id matches
+      // the :jobId in the URL. If the line doesn't exist, or belongs to a
+      // different job, return 404 and delete nothing — this prevents deleting
+      // another job's line by guessing its id.
+      const delMatch = p.match(/^\/api\/jobs\/([^/]+)\/materials\/([^/]+)$/);
+      if (delMatch && request.method === "DELETE") {
+        const jobId = delMatch[1];
+        const lineId = delMatch[2];
+        const row = await env.DB.prepare(
+          `SELECT id, job_id FROM crm_job_materials WHERE id = ?`
+        ).bind(lineId).first();
+        if (!row || String(row.job_id) !== String(jobId)) {
+          return json({ error: "not found" }, 404);
+        }
+        await env.DB.prepare(
+          `DELETE FROM crm_job_materials WHERE id = ? AND job_id = ?`
+        ).bind(lineId, jobId).run();
+        return json({ ok: true, deleted_id: row.id });
       }
 
       return json({ error: "not found" }, 404);

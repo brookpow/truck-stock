@@ -1,0 +1,11 @@
+name = "truck-stock-worker"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Same shared database as AdTrack, CRM, and GP-tracker.
+# This app reads crm_materials (catalog) and writes crm_job_materials (usage).
+[[d1_databases]]
+binding = "DB"
+database_name = "ad-attribution-db"
+database_id = "402117f6-2477-4c98-96d7-93640396d07c"

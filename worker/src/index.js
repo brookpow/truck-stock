@@ -713,6 +713,229 @@ export default {
         return json({ location_id: WAREHOUSE_ID, results });
       }
 
+      // --- 7. Catalog editor — CRUD on the SHARED crm_materials ----------
+      // GET    /api/catalog?q=&all=1   list/search (active only unless all=1)
+      // POST   /api/catalog            add a material (+ 0/0/0 stock rows at
+      //                                loc 1 & active trucks; optional par on loc 1)
+      // PATCH  /api/catalog/:id        edit any fields (fix SKU, category, …)
+      // DELETE /api/catalog/:id[?hard=1]  soft-delete (is_active=0), or hard
+      //                                delete a junk row if it has no usage.
+      if (p === "/api/catalog" && request.method === "GET") {
+        const q = (url.searchParams.get("q") || "").trim();
+        const all = url.searchParams.get("all") === "1";
+        const where = [];
+        if (!all) where.push("is_active = 1");
+        if (q) where.push("(name LIKE ? OR emco_sku LIKE ? OR code LIKE ?)");
+        const stmt = env.DB.prepare(
+          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active
+             FROM crm_materials
+            ${where.length ? "WHERE " + where.join(" AND ") : ""}
+            ORDER BY category, name`
+        );
+        const like = `%${q}%`;
+        const r = await (q ? stmt.bind(like, like, like) : stmt).all();
+        return json({ items: r.results || [] });
+      }
+
+      if (p === "/api/catalog" && request.method === "POST") {
+        const b = await request.json();
+        const name = (b.name || "").trim();
+        const category = (b.category || "").trim();
+        if (!name || !category) return json({ error: "name and category are required" }, 400);
+        const par = b.par != null && b.par !== "" ? Number(b.par) : null;
+
+        // Primary write: the catalog row (id is AUTOINCREMENT).
+        const ins = await env.DB.prepare(
+          `INSERT INTO crm_materials
+             (name, category, cost, price, emco_sku, code, bin_location, unit, subcategory, search_terms)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`
+        ).bind(
+          name, category, Number(b.cost) || 0, Number(b.price) || 0,
+          b.emco_sku || null, b.code || null, b.bin_location || null,
+          b.unit || null, b.subcategory || null, b.search_terms || null
+        ).run();
+        const id = ins.meta?.last_row_id ?? null;
+
+        // Side effects (non-fatal, reported): 0/0/0 stock rows at loc 1 + active
+        // trucks, then optional par on the shop (loc 1) via a count_adjust.
+        let stock = { rows_created: 0 };
+        try {
+          const locs = (await env.DB.prepare(
+            `SELECT id, type FROM crm_inventory_locations
+              WHERE active = 1 AND type IN ('warehouse','truck')`
+          ).all()).results || [];
+          await env.DB.batch(locs.map((l) =>
+            env.DB.prepare(
+              `INSERT INTO crm_inventory_stock (location_id, material_id, on_hand, min_qty, max_qty)
+               VALUES (?,?,0,0,0)`
+            ).bind(l.id, id)
+          ));
+          stock.rows_created = locs.length;
+
+          if (par != null && par > 0) {
+            const shop = locs.find((l) => l.type === "warehouse");
+            if (shop) {
+              await env.DB.batch([
+                env.DB.prepare(
+                  `UPDATE crm_inventory_stock
+                      SET on_hand=?, min_qty=?, max_qty=?, last_counted=datetime('now'), modified_at=datetime('now')
+                    WHERE location_id=? AND material_id=?`
+                ).bind(par, par, par, shop.id, id),
+                env.DB.prepare(
+                  `INSERT INTO crm_inventory_movements
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                   VALUES (?,?,?,?,?,?,?)`
+                ).bind(id, shop.id, par, "count_adjust", null, "new item par", b.created_by ?? 8),
+              ]);
+              stock.par_set = par;
+            }
+          }
+        } catch (e) {
+          stock.error = String(e.message || e);
+        }
+
+        return json({ ok: true, id, name, category, stock });
+      }
+
+      const catMatch = p.match(/^\/api\/catalog\/(\d+)$/);
+      if (catMatch && request.method === "PATCH") {
+        const id = catMatch[1];
+        const b = await request.json();
+        const fields = ["name","category","cost","price","emco_sku","code","bin_location","unit","subcategory","search_terms","is_active"];
+        const sets = []; const binds = [];
+        for (const f of fields) {
+          if (b[f] === undefined) continue;
+          if ((f === "name" || f === "category") && !String(b[f]).trim()) {
+            return json({ error: `${f} cannot be empty` }, 400); // NOT NULL columns
+          }
+          sets.push(`${f} = ?`);
+          binds.push(
+            ["cost","price","is_active"].includes(f) ? Number(b[f])
+              : (b[f] === null ? null : String(b[f]))
+          );
+        }
+        if (!sets.length) return json({ error: "no fields to update" }, 400);
+        const cur = await env.DB.prepare(`SELECT id, cost FROM crm_materials WHERE id=?`).bind(id).first();
+        if (!cur) return json({ error: "not found" }, 404);
+
+        // Cost FREEZES onto GP at use time, so every cost change must be
+        // auditable. When (and ONLY when) cost actually changes, log a
+        // crm_material_price_history row in the SAME batch as the update — so
+        // cost and its audit trail can never diverge.
+        const costChanging = b.cost !== undefined && Number(b.cost) !== (cur.cost ?? 0);
+        const updateStmt = env.DB.prepare(
+          `UPDATE crm_materials SET ${sets.join(", ")}, updated_at=datetime('now') WHERE id=?`
+        ).bind(...binds, id);
+        if (costChanging) {
+          await env.DB.batch([
+            updateStmt,
+            env.DB.prepare(
+              `INSERT INTO crm_material_price_history
+                 (material_id, old_cost, new_cost, source, changed_by)
+               VALUES (?,?,?,?,?)`
+            ).bind(id, cur.cost ?? null, Number(b.cost), "catalog edit", b.changed_by ?? 8),
+          ]);
+        } else {
+          await updateStmt.run();
+        }
+        const row = await env.DB.prepare(
+          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active
+             FROM crm_materials WHERE id=?`
+        ).bind(id).first();
+        return json({ ok: true, item: row, cost_logged: costChanging });
+      }
+
+      if (catMatch && request.method === "DELETE") {
+        const id = catMatch[1];
+        const hard = url.searchParams.get("hard") === "1";
+        const exists = await env.DB.prepare(`SELECT id FROM crm_materials WHERE id=?`).bind(id).first();
+        if (!exists) return json({ error: "not found" }, 404);
+        if (!hard) {
+          await env.DB.prepare(
+            `UPDATE crm_materials SET is_active=0, updated_at=datetime('now') WHERE id=?`
+          ).bind(id).run();
+          return json({ ok: true, id: Number(id), mode: "soft" });
+        }
+        // Hard delete: only for junk with NO logged usage (protect GP history).
+        const used = await env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM crm_job_materials WHERE material_id=?`
+        ).bind(id).first();
+        if ((used?.n || 0) > 0) {
+          return json({ error: "has job_materials history — use soft delete", job_lines: used.n }, 409);
+        }
+        await env.DB.batch([
+          env.DB.prepare(`DELETE FROM crm_inventory_movements WHERE material_id=?`).bind(id),
+          env.DB.prepare(`DELETE FROM crm_inventory_stock WHERE material_id=?`).bind(id),
+          env.DB.prepare(`DELETE FROM crm_materials WHERE id=?`).bind(id),
+        ]);
+        return json({ ok: true, id: Number(id), mode: "hard" });
+      }
+
+      // --- 7b. Bulk % cost change by category ----------------------------
+      // POST /api/catalog/bulk-price  Body: { category, percent, apply? }
+      //   preview (default): returns affected items old->new cost, NO writes.
+      //   apply (apply:true): per item, updates cost AND logs price_history
+      //     (shared batch_id), atomic per item + non-fatal. Only rows whose
+      //     rounded cost actually changes are written.
+      if (p === "/api/catalog/bulk-price" && request.method === "POST") {
+        const b = await request.json();
+        const category = (b.category || "").trim();
+        const percent = Number(b.percent);
+        const apply = b.apply === true;
+        if (!category) return json({ error: "category required" }, 400);
+        if (!Number.isFinite(percent)) return json({ error: "percent must be a number" }, 400);
+        if (percent <= -100) return json({ error: "percent must be > -100" }, 400);
+
+        const items = (await env.DB.prepare(
+          `SELECT id, name, cost FROM crm_materials
+            WHERE category = ? AND is_active = 1 ORDER BY name`
+        ).bind(category).all()).results || [];
+        const round2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+        const factor = 1 + percent / 100;
+
+        if (!apply) {
+          const preview = items.map((it) => {
+            const oldc = it.cost ?? 0;
+            return { material_id: it.id, name: it.name, old_cost: oldc, new_cost: round2(oldc * factor) };
+          });
+          return json({
+            mode: "preview", category, percent,
+            count: preview.length,
+            changes: preview.filter((p) => p.new_cost !== p.old_cost).length,
+            total_old: round2(preview.reduce((a, p) => a + p.old_cost, 0)),
+            total_new: round2(preview.reduce((a, p) => a + p.new_cost, 0)),
+            items: preview,
+          });
+        }
+
+        // APPLY — one batch_id ties the whole run together in price_history.
+        const batchId = `bulk-${Date.now()}`;
+        const results = [];
+        for (const it of items) {
+          const oldc = it.cost ?? 0;
+          const newc = round2(oldc * factor);
+          if (newc === oldc) { results.push({ material_id: it.id, result: "unchanged", old_cost: oldc, new_cost: newc }); continue; }
+          try {
+            await env.DB.batch([
+              env.DB.prepare(`UPDATE crm_materials SET cost=?, updated_at=datetime('now') WHERE id=?`).bind(newc, it.id),
+              env.DB.prepare(
+                `INSERT INTO crm_material_price_history
+                   (material_id, old_cost, new_cost, source, batch_id, changed_by)
+                 VALUES (?,?,?,?,?,?)`
+              ).bind(it.id, oldc, newc, `bulk ${percent >= 0 ? "+" : ""}${percent}%`, batchId, b.changed_by ?? 8),
+            ]);
+            results.push({ material_id: it.id, result: "updated", old_cost: oldc, new_cost: newc });
+          } catch (e) {
+            results.push({ material_id: it.id, result: "failed", error: String(e.message || e) });
+          }
+        }
+        return json({
+          mode: "apply", category, percent, batch_id: batchId,
+          updated: results.filter((r) => r.result === "updated").length,
+          count: items.length, results,
+        });
+      }
+
       return json({ error: "not found" }, 404);
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);

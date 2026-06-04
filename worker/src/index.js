@@ -66,15 +66,24 @@ export default {
       }
 
       // --- 0c. Van roster for the office UI -------------------------------
-      // Active truck locations with their assigned tech's name. The join is on
-      // crm_techs.st_tech_id (assigned_tech_id holds the ServiceTitan id),
-      // NOT crm_techs.id. LEFT JOIN so a van whose tech isn't in crm_techs
-      // (e.g. Graham, not yet added) still appears with a null tech_name.
+      // Active truck locations with their assigned tech's name, plus a count of
+      // materials below par (on_hand < min_qty) for the restock badge. The tech
+      // join is on crm_techs.st_tech_id (assigned_tech_id holds the ServiceTitan
+      // id), NOT crm_techs.id; LEFT JOIN so a van whose tech isn't in crm_techs
+      // (e.g. Graham) still appears with a null tech_name. The below-par count
+      // is a single GROUP BY subquery (one round trip, not N), COALESCEd to 0.
       if (p === "/api/locations/vans" && request.method === "GET") {
         const r = await env.DB.prepare(
-          `SELECT l.id, l.name, l.assigned_tech_id, t.name AS tech_name
+          `SELECT l.id, l.name, l.assigned_tech_id, t.name AS tech_name,
+                  COALESCE(c.below_par_count, 0) AS below_par_count
              FROM crm_inventory_locations l
              LEFT JOIN crm_techs t ON t.st_tech_id = l.assigned_tech_id
+             LEFT JOIN (
+               SELECT location_id, COUNT(*) AS below_par_count
+                 FROM crm_inventory_stock
+                WHERE on_hand < min_qty
+                GROUP BY location_id
+             ) c ON c.location_id = l.id
             WHERE l.type = 'truck' AND l.active = 1
             ORDER BY l.name`
         ).all();
@@ -274,7 +283,7 @@ export default {
         let stock = { reversed: false, reason: "no_deduction_found" };
         try {
           const orig = await env.DB.prepare(
-            `SELECT location_id, qty_change FROM crm_inventory_movements
+            `SELECT location_id FROM crm_inventory_movements
               WHERE reference_id = ? AND reason = 'job_usage'
               ORDER BY id DESC LIMIT 1`
           ).bind(row.id).first();
@@ -283,7 +292,12 @@ export default {
             stock = { reversed: false, reason: "no_deduction_found" };
           } else {
             const locId = orig.location_id;
-            const restoreQty = -orig.qty_change; // qty_change was negative
+            // Restore the line's FULL current quantity, not just the original
+            // job_usage amount. A line's net deduction always equals its current
+            // quantity (log deducts -qty; each PATCH adjusts by -delta), so if it
+            // was quantity-edited the deducted total is row.quantity — reversing
+            // -orig.qty_change alone would leave the qty-edit delta unrestored.
+            const restoreQty = row.quantity;
             const srow = await env.DB.prepare(
               `SELECT id, on_hand FROM crm_inventory_stock
                 WHERE location_id = ? AND material_id = ?`

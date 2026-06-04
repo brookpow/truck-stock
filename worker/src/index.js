@@ -24,7 +24,7 @@ const json = (data, status = 200) =>
 
 const cors = () => ({
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
+  "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 });
 
@@ -333,6 +333,104 @@ export default {
         }
 
         return json({ ok: true, deleted_id: row.id, stock });
+      }
+
+      // --- 4b. Edit a logged line's quantity (online v1) -----------------
+      // PATCH /api/jobs/:jobId/materials/:lineId   Body: { quantity }
+      // Recompute total_cost from the FROZEN unit_cost (qty x unit_cost), then
+      // adjust van stock by the delta: more qty -> deduct the extra, less qty
+      // -> restore the difference. Like the delete reversal, the van is found
+      // from the ORIGINAL job_usage movement's location (the tech's current van
+      // may differ). The line update is the source of truth; the stock
+      // adjustment is atomic and non-fatal.
+      if (delMatch && request.method === "PATCH") {
+        const jobId = delMatch[1];
+        const lineId = delMatch[2];
+        const b = await request.json();
+        const newQty = Number(b.quantity);
+        if (!(newQty > 0)) {
+          return json({ error: "quantity must be > 0 (use DELETE to remove)" }, 400);
+        }
+        // Scope check (same as delete) + fetch what we need to recompute/adjust.
+        const row = await env.DB.prepare(
+          `SELECT id, job_id, material_id, quantity, unit_cost, tech_id
+             FROM crm_job_materials WHERE id = ?`
+        ).bind(lineId).first();
+        if (!row || String(row.job_id) !== String(jobId)) {
+          return json({ error: "not found" }, 404);
+        }
+        const oldQty = row.quantity;
+        const unitCost = row.unit_cost ?? 0;
+        const newTotal = unitCost * newQty;
+
+        // Source of truth: update the usage line (qty + recomputed total). Cost
+        // stays FROZEN — we never re-read the catalog. Must succeed (a throw
+        // here returns 500 via the outer catch).
+        await env.DB.prepare(
+          `UPDATE crm_job_materials SET quantity = ?, total_cost = ? WHERE id = ?`
+        ).bind(newQty, newTotal, lineId).run();
+
+        // --- Stock-delta hinge (atomic, non-fatal) -------------------------
+        // delta = newQty - oldQty; on_hand moves by -delta (more usage lowers
+        // stock, less usage raises it), so qty_change = -delta. Recorded as
+        // 'manual' — the allowed CHECK reason we already use for usage
+        // corrections (no 'qty_edit'/'usage_reversed' in the CHECK set) — with
+        // the before->after in notes. Negative on_hand allowed and flagged.
+        let stock = { adjusted: false, reason: "no_change" };
+        if (newQty !== oldQty) {
+          stock = { adjusted: false, reason: "no_deduction_found" };
+          try {
+            const delta = newQty - oldQty;
+            const orig = await env.DB.prepare(
+              `SELECT location_id FROM crm_inventory_movements
+                WHERE reference_id = ? AND reason = 'job_usage'
+                ORDER BY id DESC LIMIT 1`
+            ).bind(row.id).first();
+            if (orig) {
+              const locId = orig.location_id;
+              const srow = await env.DB.prepare(
+                `SELECT id, on_hand FROM crm_inventory_stock
+                  WHERE location_id = ? AND material_id = ?`
+              ).bind(locId, row.material_id).first();
+              if (!srow) {
+                stock = { adjusted: false, reason: "stock_row_missing", location_id: locId };
+              } else {
+                const before = srow.on_hand ?? 0;
+                const after = before - delta; // more qty -> lower stock
+                await env.DB.batch([
+                  env.DB.prepare(
+                    `UPDATE crm_inventory_stock
+                        SET on_hand = ?, modified_at = datetime('now')
+                      WHERE id = ?`
+                  ).bind(after, srow.id),
+                  env.DB.prepare(
+                    `INSERT INTO crm_inventory_movements
+                       (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                     VALUES (?,?,?,?,?,?,?)`
+                  ).bind(
+                    row.material_id, locId, -delta, "manual", row.id,
+                    `qty edit: line ${row.id} ${oldQty}->${newQty}`, row.tech_id ?? null
+                  ),
+                ]);
+                stock = {
+                  adjusted: true, location_id: locId, delta,
+                  on_hand_before: before, on_hand_after: after, below_zero: after < 0,
+                };
+              }
+            }
+          } catch (e) {
+            stock = { adjusted: false, error: String(e.message || e) };
+          }
+        }
+
+        return json({
+          ok: true,
+          job_material_id: row.id,
+          quantity: newQty,
+          unit_cost: unitCost,
+          total_cost: newTotal,
+          stock,
+        });
       }
 
       // --- 5a. Replenishment list for a van ------------------------------

@@ -37,6 +37,22 @@ export async function logMaterial(jobId, body) {
   return r.json();
 }
 
+// Online-only for v1. Kept a plain call (like deleteMaterial) so a future
+// offline version can route qty edits through syncQueue without changing this
+// contract. Returns { ok, quantity, unit_cost, total_cost, stock }.
+export async function patchMaterialQty(jobId, lineId, quantity) {
+  const r = await fetch(
+    `${API}/api/jobs/${encodeURIComponent(jobId)}/materials/${encodeURIComponent(lineId)}`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ quantity }),
+    }
+  );
+  if (!r.ok) throw new Error("qty " + r.status);
+  return r.json();
+}
+
 export async function deleteMaterial(jobId, lineId) {
   // Hard delete of one logged line. The worker scope-checks that lineId
   // belongs to jobId and 404s otherwise (deleting nothing).

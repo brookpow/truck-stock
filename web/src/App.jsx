@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial } from "./api";
+import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 
 const fmt = (n) => "$" + (Number(n) || 0).toFixed(2);
@@ -134,6 +134,7 @@ function Capture({ tech, job, onBack }) {
   const [total, setTotal] = useState(0);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState(null); // line id currently deleting
+  const [qtySavingId, setQtySavingId] = useState(null); // line id whose qty is saving
   const [pending, setPending] = useState(pendingCount());       // global count (banner)
   const [pendingItems, setPendingItems] = useState([]);         // this job's queued saves
   const [note, setNote] = useState("");                          // transient status note
@@ -234,6 +235,25 @@ function Capture({ tech, job, onBack }) {
       alert("Couldn't save: " + (e.message || e));
     } finally {
       setSaving(false);
+    }
+  }
+
+  // Commit a quantity edit from a logged row's numeric input. Online-only:
+  // calls PATCH then refreshes. Ignores no-ops; resets the field on bad/failed
+  // input so it never shows a value the server didn't accept.
+  async function commitQty(it, inputEl) {
+    const q = Math.floor(Number(inputEl.value));
+    if (!Number.isFinite(q) || q <= 0) { inputEl.value = String(it.quantity); return; }
+    if (q === it.quantity) return; // unchanged
+    setQtySavingId(it.id);
+    try {
+      await patchMaterialQty(job.id, it.id, q);
+      refresh();
+    } catch (e) {
+      alert("Couldn't update quantity: " + (e.message || e));
+      inputEl.value = String(it.quantity); // revert to last-known-good
+    } finally {
+      setQtySavingId(null);
     }
   }
 
@@ -343,8 +363,24 @@ function Capture({ tech, job, onBack }) {
         <div key={it.id} style={styles.loggedRow}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={styles.ellip}>{it.name || ("Material #" + it.material_id)}</div>
-            <div style={styles.muted}>{fmt(it.unit_cost)} × {it.quantity} = {fmt(it.total_cost)}</div>
+            <div style={styles.muted}>{fmt(it.unit_cost)} each · {fmt(it.total_cost)}</div>
           </div>
+          {/* Quantity editor. Uncontrolled + key includes quantity so the field
+              resets to the server value after a successful edit. Numeric keypad
+              on phones; commits on blur / Enter. */}
+          <input
+            key={"qty-" + it.id + "-" + it.quantity}
+            type="text"
+            inputMode="numeric"
+            pattern="[0-9]*"
+            defaultValue={it.quantity}
+            disabled={qtySavingId === it.id}
+            style={styles.qtyInput}
+            onFocus={(e) => e.target.select()}
+            onBlur={(e) => commitQty(it, e.target)}
+            onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+            aria-label={"quantity for " + (it.name || ("material #" + it.material_id))}
+          />
           <button
             style={styles.delBtn}
             disabled={deletingId === it.id}
@@ -375,6 +411,7 @@ const styles = {
   resultRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fff" },
   addBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#1d9e75", color: "#fff", cursor: "pointer" },
   delBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#c0392b", color: "#fff", cursor: "pointer" },
+  qtyInput: { width: 52, height: 44, flex: "none", marginLeft: 8, fontSize: 16, textAlign: "center", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, padding: "0 4px" },
   totalBar: { display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: "1px solid #ddd", paddingTop: 12, marginTop: 12, marginBottom: 8 },
   inclPending: { color: "#8a5a00", fontStyle: "italic" },
   loggedRow: { display: "flex", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #eee" },

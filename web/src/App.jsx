@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, logMaterial, deleteMaterial } from "./api";
+import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial } from "./api";
+import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 
 const fmt = (n) => "$" + (Number(n) || 0).toFixed(2);
 const STORE_KEY = "ts_tech"; // remembers the logged-in tech on this device
@@ -13,6 +14,15 @@ export default function App() {
     if (saved) {
       try { setTech(JSON.parse(saved)); } catch {}
     }
+  }, []);
+
+  // Start the offline-save auto-flush once for the whole app. When the queue
+  // drains (or changes), broadcast so the Capture screen can update its
+  // pending badge and re-pull the current job's list for anything that synced.
+  useEffect(() => {
+    startAutoFlush((r) => {
+      window.dispatchEvent(new CustomEvent("ts-queue-changed", { detail: r }));
+    });
   }, []);
 
   function chooseTech(t) {
@@ -124,16 +134,67 @@ function Capture({ tech, job, onBack }) {
   const [total, setTotal] = useState(0);
   const [saving, setSaving] = useState(false);
   const [deletingId, setDeletingId] = useState(null); // line id currently deleting
+  const [pending, setPending] = useState(pendingCount());       // global count (banner)
+  const [pendingItems, setPendingItems] = useState([]);         // this job's queued saves
+  const [note, setNote] = useState("");                          // transient status note
   const timer = useRef(null);
+  const noteTimer = useRef(null);
 
-  // Load already-logged materials for this job.
+  // Load already-logged materials for this job (server-confirmed lines).
   function refresh() {
     getJobMaterials(job.id).then((r) => {
       setItems(r.items || []);
       setTotal(r.total_material_cost || 0);
     }).catch(() => {});
   }
-  useEffect(refresh, [job]);
+
+  // Recompute the offline view: the banner count + this job's queued items.
+  function refreshPendingView() {
+    setPending(pendingCount());
+    setPendingItems(pendingItemsForJob(job.id));
+  }
+  useEffect(() => { refresh(); refreshPendingView(); }, [job]);
+
+  // Show a brief note that auto-clears (e.g. "Saved offline…").
+  function flashNote(msg) {
+    setNote(msg);
+    clearTimeout(noteTimer.current);
+    noteTimer.current = setTimeout(() => setNote(""), 3000);
+  }
+
+  // Manual "sync now" — tapping the banner forces a flush attempt instead of
+  // waiting for startAutoFlush's automatic triggers. Updates the pending count
+  // from the result and re-pulls the job list for anything that synced.
+  const [syncing, setSyncing] = useState(false);
+  async function syncNow() {
+    if (syncing) return;
+    setSyncing(true);
+    try {
+      const r = await flushQueue();
+      refreshPendingView();
+      // Broadcast so any future listeners behave the same as on auto-flush.
+      window.dispatchEvent(new CustomEvent("ts-queue-changed", { detail: r }));
+      if (r.synced > 0) {
+        refresh();
+        flashNote(`Synced ${r.synced} item${r.synced === 1 ? "" : "s"}`);
+      } else if (r.remaining > 0) {
+        flashNote("Still offline — will keep trying");
+      }
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  // React to the app-level auto-flush: update the pending badge, and if
+  // anything actually synced, re-pull this job's list so the items appear.
+  useEffect(() => {
+    const onQueueChanged = (e) => {
+      refreshPendingView();
+      if (e.detail && e.detail.synced > 0) refresh();
+    };
+    window.addEventListener("ts-queue-changed", onQueueChanged);
+    return () => window.removeEventListener("ts-queue-changed", onQueueChanged);
+  }, [job]);
 
   // Debounced search.
   useEffect(() => {
@@ -148,14 +209,27 @@ function Capture({ tech, job, onBack }) {
   async function add(m) {
     setSaving(true);
     try {
-      await logMaterial(job.id, {
+      const res = await logMaterialResilient(job.id, {
         material_id: m.id,
         quantity: 1,
         tech_id: tech.st_tech_id,
         job_number: job.num,
+        // Display-only fields (underscore-prefixed). The worker ignores unknown
+        // keys, so these ride along only to render the queued item optimistically
+        // before it syncs. _cost is the catalog estimate; the server freezes the
+        // authoritative cost at flush time.
+        _name: m.name,
+        _cost: m.cost,
       });
       setQ(""); setResults([]);
-      refresh();
+      if (res.queued) {
+        // Save failed but is safely queued — reassure, don't alarm. The item is
+        // shown immediately as a pending row so the tech won't re-log it.
+        refreshPendingView();
+        flashNote("Saved offline — will sync when back online");
+      } else {
+        refresh();
+      }
     } catch (e) {
       alert("Couldn't save: " + (e.message || e));
     } finally {
@@ -175,12 +249,40 @@ function Capture({ tech, job, onBack }) {
     }
   }
 
+  // Undo a queued (not-yet-synced) item — purely a local-queue delete, no
+  // server call, since it never reached the server.
+  function removePending(p) {
+    removeFromQueue(p);
+    refreshPendingView();
+  }
+
+  // Estimated cost of queued-but-unsynced items (catalog cost we already have).
+  // Folded into the displayed total, but labelled so it's clear it's not yet
+  // server-confirmed.
+  const pendingEst = pendingItems.reduce(
+    (a, p) => a + (Number(p.body._cost) || 0) * (Number(p.body.quantity) || 0),
+    0
+  );
+
   return (
     <div style={styles.screen}>
       <div style={styles.topbar}>
         <button style={styles.linkBtn} onClick={onBack}>← jobs</button>
         <span style={styles.who}>{job.cust || job.num}</span>
       </div>
+
+      {pending > 0 && (
+        <button
+          style={styles.syncBanner}
+          onClick={syncNow}
+          disabled={syncing}
+          aria-label="sync pending items now"
+        >
+          ⏳ {pending} item{pending === 1 ? "" : "s"} waiting to sync
+          {" · "}{syncing ? "syncing…" : "tap to sync now"}
+        </button>
+      )}
+      {note && <div style={styles.note}>{note}</div>}
 
       <input
         style={styles.input}
@@ -201,11 +303,42 @@ function Capture({ tech, job, onBack }) {
       ))}
 
       <div style={styles.totalBar}>
-        <span style={styles.muted}>On this job</span>
-        <span style={{ fontSize: 20, fontWeight: 500 }}>{fmt(total)}</span>
+        <span style={styles.muted}>
+          On this job
+          {pendingItems.length > 0 && (
+            <span style={styles.inclPending}> (incl. {pendingItems.length} pending)</span>
+          )}
+        </span>
+        <span style={{ fontSize: 20, fontWeight: 500 }}>{fmt(total + pendingEst)}</span>
       </div>
 
-      {items.length === 0 && <div style={styles.muted}>No materials logged yet.</div>}
+      {items.length === 0 && pendingItems.length === 0 && (
+        <div style={styles.muted}>No materials logged yet.</div>
+      )}
+
+      {/* Optimistic rows: queued offline, not yet on the server. Shown greyed
+          with ⏳ so the tech always sees what they logged and won't re-add it.
+          No delete button — there's no server line id to delete yet. */}
+      {pendingItems.map((p, i) => (
+        <div key={"pending-" + p.queued_at + "-" + i} style={styles.pendingRow}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={styles.ellip}>
+              {p.body._name || ("Material #" + p.body.material_id)}
+            </div>
+            <div style={styles.muted}>
+              ⏳ pending · {fmt(p.body._cost)} × {p.body.quantity} (est.)
+            </div>
+          </div>
+          <button
+            style={styles.delBtn}
+            onClick={() => removePending(p)}
+            aria-label={"remove pending " + (p.body._name || ("material #" + p.body.material_id))}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+
       {items.map((it) => (
         <div key={it.id} style={styles.loggedRow}>
           <div style={{ minWidth: 0, flex: 1 }}>
@@ -243,6 +376,10 @@ const styles = {
   addBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#1d9e75", color: "#fff", cursor: "pointer" },
   delBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#c0392b", color: "#fff", cursor: "pointer" },
   totalBar: { display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: "1px solid #ddd", paddingTop: 12, marginTop: 12, marginBottom: 8 },
+  inclPending: { color: "#8a5a00", fontStyle: "italic" },
   loggedRow: { display: "flex", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #eee" },
+  pendingRow: { display: "flex", alignItems: "center", padding: "8px 0", borderBottom: "1px dashed #ddd", opacity: 0.6 },
+  syncBanner: { display: "block", width: "100%", textAlign: "left", font: "inherit", fontSize: 13, color: "#8a5a00", background: "#fff5e0", border: "1px solid #f0d68a", borderRadius: 8, padding: "10px", marginBottom: 10, cursor: "pointer" },
+  note: { fontSize: 13, color: "#185fa5", background: "#eaf2fb", border: "1px solid #bcd6f2", borderRadius: 8, padding: "8px 10px", marginBottom: 10 },
   ellip: { fontSize: 15, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
 };

@@ -105,7 +105,7 @@ export default {
 
         // is_prepull lets you distinguish materials pulled for a job vs actually used.
         // Defaults to 0 (used) unless the caller marks it a pre-pull.
-        await env.DB.prepare(
+        const ins = await env.DB.prepare(
           `INSERT INTO crm_job_materials
              (job_id, job_number, material_id, quantity, unit_cost, total_cost,
               tech_id, truck_location_id, notes, is_prepull)
@@ -122,8 +122,81 @@ export default {
           b.notes ?? null,
           b.is_prepull ? 1 : 0
         ).run();
+        const jobMaterialId = ins.meta?.last_row_id ?? null;
 
-        return json({ ok: true, unit_cost: unitCost, total_cost: totalCost });
+        // --- Stock-deduction hinge -------------------------------------------
+        // The usage record above is the SOURCE OF TRUTH and is already committed.
+        // Everything below adjusts van stock as a best-effort side effect: any
+        // failure here is caught and reported, NEVER fatal to the material log.
+        // We deduct only from the logging tech's own van.
+        let stock = { deducted: false, reason: "no_van_for_tech" };
+        try {
+          // Resolve the tech's active van. tech_id in the log body is the
+          // ServiceTitan id, which is what crm_inventory_locations stores in
+          // assigned_tech_id. active=1 excludes the retired test rig.
+          const van = b.tech_id == null ? null : await env.DB.prepare(
+            `SELECT id FROM crm_inventory_locations
+              WHERE type = 'truck' AND active = 1 AND assigned_tech_id = ?`
+          ).bind(b.tech_id).first();
+
+          if (!van) {
+            // Tech has no resolvable van — log stands, no movement. Noted.
+            stock = { deducted: false, reason: "no_van_for_tech" };
+          } else {
+            // Deduct only if this material is actually stocked on the van.
+            // No stock row => non-van / counter item => skip (no deduction).
+            const row = await env.DB.prepare(
+              `SELECT id, on_hand FROM crm_inventory_stock
+                WHERE location_id = ? AND material_id = ?`
+            ).bind(van.id, b.material_id).first();
+
+            if (!row) {
+              stock = { deducted: false, reason: "not_van_stocked", location_id: van.id };
+            } else {
+              const before = row.on_hand ?? 0;
+              const after = before - b.quantity; // allow negative — never block
+              // Atomic: stock update + ledger row succeed or fail together, so
+              // on_hand and the movement log can never diverge.
+              await env.DB.batch([
+                env.DB.prepare(
+                  `UPDATE crm_inventory_stock
+                      SET on_hand = ?, modified_at = datetime('now')
+                    WHERE id = ?`
+                ).bind(after, row.id),
+                env.DB.prepare(
+                  `INSERT INTO crm_inventory_movements
+                     (material_id, location_id, qty_change, reason, reference_id, created_by)
+                   VALUES (?,?,?,?,?,?)`
+                ).bind(
+                  b.material_id,
+                  van.id,
+                  -b.quantity,
+                  "job_usage",
+                  jobMaterialId,        // reference back to the crm_job_materials row
+                  b.tech_id ?? null
+                ),
+              ]);
+              stock = {
+                deducted: true,
+                location_id: van.id,
+                on_hand_before: before,
+                on_hand_after: after,
+                below_zero: after < 0,   // surface "needs review" later
+              };
+            }
+          }
+        } catch (e) {
+          // Deduction failed — report it, but the material log itself stands.
+          stock = { deducted: false, error: String(e.message || e) };
+        }
+
+        return json({
+          ok: true,
+          job_material_id: jobMaterialId,
+          unit_cost: unitCost,
+          total_cost: totalCost,
+          stock,
+        });
       }
 
       // --- 3. List materials logged on a job ------------------------------
@@ -158,8 +231,11 @@ export default {
       if (delMatch && request.method === "DELETE") {
         const jobId = delMatch[1];
         const lineId = delMatch[2];
+        // Fetch the columns we need both for the scope check AND to reverse the
+        // stock deduction symmetrically (material_id, quantity, tech_id).
         const row = await env.DB.prepare(
-          `SELECT id, job_id FROM crm_job_materials WHERE id = ?`
+          `SELECT id, job_id, material_id, quantity, tech_id
+             FROM crm_job_materials WHERE id = ?`
         ).bind(lineId).first();
         if (!row || String(row.job_id) !== String(jobId)) {
           return json({ error: "not found" }, 404);
@@ -167,7 +243,80 @@ export default {
         await env.DB.prepare(
           `DELETE FROM crm_job_materials WHERE id = ? AND job_id = ?`
         ).bind(lineId, jobId).run();
-        return json({ ok: true, deleted_id: row.id });
+
+        // --- Stock-reversal hinge (mirror of the deduction on log) -----------
+        // The line is already deleted (source of truth). Restoring van stock is
+        // a best-effort side effect: any failure here is caught and reported,
+        // NEVER fatal to the delete.
+        //
+        // We reverse against the location the material was ORIGINALLY deducted
+        // from — found via the ledger (the job_usage movement whose reference_id
+        // is this line) — NOT the tech's current van, which may have changed
+        // since logging. If no such movement exists, nothing was ever deducted
+        // (no van / counter item / deduction errored), so there's nothing to
+        // reverse.
+        let stock = { reversed: false, reason: "no_deduction_found" };
+        try {
+          const orig = await env.DB.prepare(
+            `SELECT location_id, qty_change FROM crm_inventory_movements
+              WHERE reference_id = ? AND reason = 'job_usage'
+              ORDER BY id DESC LIMIT 1`
+          ).bind(row.id).first();
+
+          if (!orig) {
+            stock = { reversed: false, reason: "no_deduction_found" };
+          } else {
+            const locId = orig.location_id;
+            const restoreQty = -orig.qty_change; // qty_change was negative
+            const srow = await env.DB.prepare(
+              `SELECT id, on_hand FROM crm_inventory_stock
+                WHERE location_id = ? AND material_id = ?`
+            ).bind(locId, row.material_id).first();
+
+            if (!srow) {
+              // Deduction existed but its stock row is gone — can't restore it.
+              stock = { reversed: false, reason: "stock_row_missing", location_id: locId };
+            } else {
+              const before = srow.on_hand ?? 0;
+              const after = before + restoreQty; // restore exactly what was deducted
+              // reason 'usage_reversed' isn't in the crm_inventory_movements
+              // CHECK constraint, so we record it as an allowed 'manual'
+              // adjustment and carry the intent + source line in notes.
+              // Atomic batch keeps on_hand and the ledger in lockstep.
+              await env.DB.batch([
+                env.DB.prepare(
+                  `UPDATE crm_inventory_stock
+                      SET on_hand = ?, modified_at = datetime('now')
+                    WHERE id = ?`
+                ).bind(after, srow.id),
+                env.DB.prepare(
+                  `INSERT INTO crm_inventory_movements
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                   VALUES (?,?,?,?,?,?,?)`
+                ).bind(
+                  row.material_id,
+                  locId,                 // the ORIGINAL deduction's location
+                  restoreQty,            // positive — compensating movement
+                  "manual",
+                  row.id,                // reference back to the deleted line id
+                  `usage_reversed; line ${row.id}`,
+                  row.tech_id ?? null
+                ),
+              ]);
+              stock = {
+                reversed: true,
+                location_id: locId,
+                on_hand_before: before,
+                on_hand_after: after,
+              };
+            }
+          }
+        } catch (e) {
+          // Reversal failed — report it, but the delete itself stands.
+          stock = { reversed: false, error: String(e.message || e) };
+        }
+
+        return json({ ok: true, deleted_id: row.id, stock });
       }
 
       return json({ error: "not found" }, 404);

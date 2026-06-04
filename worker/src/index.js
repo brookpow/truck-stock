@@ -319,6 +319,151 @@ export default {
         return json({ ok: true, deleted_id: row.id, stock });
       }
 
+      // --- 5. Confirm a van restock --------------------------------------
+      // POST /api/restock/:locationId/confirm
+      // Body: { items: [{ material_id, pulled_qty, shop_out }], created_by? }
+      //
+      // Per item, ATOMIC and NON-FATAL:
+      //   pulled_qty > 0 : move stock shop(loc 1) -> van in ONE env.DB.batch —
+      //     van.on_hand += pulled_qty (+ transfer_in movement, + last_restocked)
+      //     warehouse.on_hand -= pulled_qty (+ transfer_out movement, may go <0)
+      //     Both movement legs share one reference_id so the transfer is linkable.
+      //   else shop_out  : NO stock change. Seed a crm_inventory_requests row
+      //     (type 'shop_reorder') for the shortfall (max_qty - on_hand) to feed
+      //     the future EMCO reorder list.
+      //   else           : skipped (neither pulled nor shop_out).
+      // One item failing is reported as 'failed' and never blocks the others.
+      const restockMatch = p.match(/^\/api\/restock\/([^/]+)\/confirm$/);
+      if (restockMatch && request.method === "POST") {
+        const locationId = restockMatch[1];
+        const body = await request.json();
+        const items = Array.isArray(body.items) ? body.items : null;
+        if (!items) return json({ error: "items array required" }, 400);
+        // Restock operator: crm_users.id used for movement created_by AND the
+        // shop_reorder requested_by (which is NOT NULL). Defaults to the
+        // Warehouse Manager (crm_users.id 8) unless the caller passes created_by.
+        // TODO: requests.requested_by is commented FK crm_users.id; revisit if a
+        // dedicated office requester is introduced later.
+        const OFFICE_OPERATOR = 8; // crm_users.id — Warehouse Manager
+        const operator = body.created_by ?? OFFICE_OPERATOR;
+        const WAREHOUSE_ID = 1; // Shop Warehouse (type='warehouse')
+
+        // Guard: the target must be an existing truck — never the shop or a bad id.
+        const loc = await env.DB.prepare(
+          `SELECT id, type FROM crm_inventory_locations WHERE id = ?`
+        ).bind(locationId).first();
+        if (!loc) return json({ error: "location not found" }, 404);
+        if (loc.type !== "truck") return json({ error: "location is not a truck" }, 400);
+
+        // Base for transfer reference_ids — each item's two legs share refBase+i,
+        // so the in/out legs of one pull are linkable (and distinct per item).
+        // FUTURE IMPROVEMENT: create a real crm_inventory_transfers record per
+        // pull and use its id as reference_id (true FK, reversible like CRM's
+        // /transfers/:id/reverse) instead of this synthetic shared token.
+        const refBase = Date.now() * 1000;
+
+        const results = [];
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i] || {};
+          const mid = it.material_id;
+          const pulled = Number(it.pulled_qty) || 0;
+          try {
+            if (mid == null) throw new Error("material_id required");
+
+            if (pulled > 0) {
+              // Need the van row AND the warehouse row to move stock between them.
+              const vanRow = await env.DB.prepare(
+                `SELECT id, on_hand FROM crm_inventory_stock
+                  WHERE location_id = ? AND material_id = ?`
+              ).bind(locationId, mid).first();
+              const whRow = await env.DB.prepare(
+                `SELECT id, on_hand FROM crm_inventory_stock
+                  WHERE location_id = ? AND material_id = ?`
+              ).bind(WAREHOUSE_ID, mid).first();
+              if (!vanRow) throw new Error("no van stock row");
+              if (!whRow) throw new Error("no warehouse stock row");
+
+              const vanAfter = (vanRow.on_hand ?? 0) + pulled;
+              const whAfter = (whRow.on_hand ?? 0) - pulled; // may go negative
+              const ref = refBase + i; // shared by both legs of THIS pull
+
+              // One atomic batch: both stock rows + both ledger legs move
+              // together, or none do.
+              await env.DB.batch([
+                env.DB.prepare(
+                  `UPDATE crm_inventory_stock
+                      SET on_hand = ?, last_restocked = datetime('now'),
+                          modified_at = datetime('now')
+                    WHERE id = ?`
+                ).bind(vanAfter, vanRow.id),
+                env.DB.prepare(
+                  `INSERT INTO crm_inventory_movements
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                   VALUES (?,?,?,?,?,?,?)`
+                ).bind(mid, locationId, pulled, "transfer_in", ref, "restock pull (shop->van)", operator),
+                env.DB.prepare(
+                  `UPDATE crm_inventory_stock
+                      SET on_hand = ?, modified_at = datetime('now')
+                    WHERE id = ?`
+                ).bind(whAfter, whRow.id),
+                env.DB.prepare(
+                  `INSERT INTO crm_inventory_movements
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                   VALUES (?,?,?,?,?,?,?)`
+                ).bind(mid, WAREHOUSE_ID, -pulled, "transfer_out", ref, "restock pull (shop->van)", operator),
+              ]);
+              results.push({ material_id: mid, result: "restocked" });
+            } else if (it.shop_out) {
+              // No stock change — seed a reorder request for the shortfall.
+              const vanRow = await env.DB.prepare(
+                `SELECT on_hand, max_qty FROM crm_inventory_stock
+                  WHERE location_id = ? AND material_id = ?`
+              ).bind(locationId, mid).first();
+              if (!vanRow) throw new Error("no van stock row");
+              const shortfall = (vanRow.max_qty ?? 0) - (vanRow.on_hand ?? 0);
+              if (shortfall <= 0) {
+                // Already at/above par — nothing to reorder, don't seed a request.
+                results.push({ material_id: mid, result: "skipped", reason: "at_or_above_par" });
+              } else {
+                await env.DB.prepare(
+                  `INSERT INTO crm_inventory_requests
+                     (material_id, quantity, truck_location_id, requested_by,
+                      status, type, notes)
+                   VALUES (?,?,?,?,?,?,?)`
+                ).bind(
+                  mid, shortfall, locationId, operator,
+                  "pending", "shop_reorder", "shop out during restock"
+                ).run();
+                results.push({ material_id: mid, result: "shop_reorder", quantity: shortfall });
+              }
+            } else {
+              results.push({ material_id: mid, result: "skipped", reason: "not_requested" });
+            }
+          } catch (e) {
+            results.push({ material_id: mid, result: "failed", error: String(e.message || e) });
+          }
+        }
+
+        // Return the van's updated on_hand for each material (chunked to stay
+        // under D1's SQL-variable limit).
+        const mids = [...new Set(items.map((x) => x && x.material_id).filter((x) => x != null))];
+        const onHandMap = {};
+        for (let j = 0; j < mids.length; j += 100) {
+          const chunk = mids.slice(j, j + 100);
+          const ph = chunk.map(() => "?").join(",");
+          const r = await env.DB.prepare(
+            `SELECT material_id, on_hand FROM crm_inventory_stock
+              WHERE location_id = ? AND material_id IN (${ph})`
+          ).bind(locationId, ...chunk).all();
+          for (const sr of (r.results || [])) onHandMap[sr.material_id] = sr.on_hand;
+        }
+        const on_hand = Object.entries(onHandMap).map(
+          ([material_id, oh]) => ({ material_id: Number(material_id), on_hand: oh })
+        );
+
+        return json({ location_id: Number(locationId) || locationId, results, on_hand });
+      }
+
       return json({ error: "not found" }, 404);
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);

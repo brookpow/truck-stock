@@ -65,6 +65,22 @@ export default {
         return json({ jobs: [], fallback: "manual" });
       }
 
+      // --- 0c. Van roster for the office UI -------------------------------
+      // Active truck locations with their assigned tech's name. The join is on
+      // crm_techs.st_tech_id (assigned_tech_id holds the ServiceTitan id),
+      // NOT crm_techs.id. LEFT JOIN so a van whose tech isn't in crm_techs
+      // (e.g. Graham, not yet added) still appears with a null tech_name.
+      if (p === "/api/locations/vans" && request.method === "GET") {
+        const r = await env.DB.prepare(
+          `SELECT l.id, l.name, l.assigned_tech_id, t.name AS tech_name
+             FROM crm_inventory_locations l
+             LEFT JOIN crm_techs t ON t.st_tech_id = l.assigned_tech_id
+            WHERE l.type = 'truck' AND l.active = 1
+            ORDER BY l.name`
+        ).all();
+        return json(r.results || []);
+      }
+
       // --- 1. Search-as-you-type over the catalog -------------------------
       // Matches name, code, or EMCO SKU. Returns cost so the capture screen
       // can freeze it onto the job line at time of use.
@@ -317,6 +333,26 @@ export default {
         }
 
         return json({ ok: true, deleted_id: row.id, stock });
+      }
+
+      // --- 5a. Replenishment list for a van ------------------------------
+      // GET /api/restock/:locationId/list
+      // The validated replenishment query: materials on this van below reorder
+      // point (on_hand < min_qty), with the suggested pull to bring them to par
+      // (max_qty - on_hand). Matches what we validated against loc 2.
+      const restockListMatch = p.match(/^\/api\/restock\/([^/]+)\/list$/);
+      if (restockListMatch && request.method === "GET") {
+        const locationId = restockListMatch[1];
+        const r = await env.DB.prepare(
+          `SELECT s.material_id, m.name, m.emco_sku, m.cost,
+                  s.on_hand, s.min_qty, s.max_qty,
+                  (s.max_qty - s.on_hand) AS suggested_pull
+             FROM crm_inventory_stock s
+             JOIN crm_materials m ON m.id = s.material_id
+            WHERE s.location_id = ? AND s.on_hand < s.min_qty
+            ORDER BY m.name`
+        ).bind(locationId).all();
+        return json({ location_id: Number(locationId) || locationId, items: r.results || [] });
       }
 
       // --- 5. Confirm a van restock --------------------------------------

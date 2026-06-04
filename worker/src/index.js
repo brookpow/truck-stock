@@ -612,6 +612,107 @@ export default {
         return json({ location_id: Number(locationId) || locationId, results, on_hand });
       }
 
+      // --- 6a. Shop (warehouse) stock — full dump for count/levels views --
+      // GET /api/shop/stock -> every loc-1 stock row joined to the catalog,
+      // ordered by category then name so the UI can group by category. Feeds
+      // both the physical count screen and the min/max levels screen.
+      if (p === "/api/shop/stock" && request.method === "GET") {
+        const r = await env.DB.prepare(
+          `SELECT s.material_id, m.name, m.emco_sku, m.category, m.bin_location,
+                  s.on_hand, s.min_qty, s.max_qty, s.last_counted
+             FROM crm_inventory_stock s
+             JOIN crm_materials m ON m.id = s.material_id
+            WHERE s.location_id = 1
+            ORDER BY m.category, m.name`
+        ).all();
+        return json({ location_id: 1, items: r.results || [] });
+      }
+
+      // --- 6b. Shop stock save — batch (a category's worth at once) -------
+      // POST /api/shop/stock
+      // Body: { items: [{ material_id, on_hand?, min_qty?, max_qty? }], created_by? }
+      // Per item, atomic + non-fatal:
+      //   on_hand provided -> set it and stamp last_counted; if it changed,
+      //     write a count_adjust movement (qty_change = counted - current) in
+      //     the SAME batch so stock + ledger never diverge.
+      //   min_qty/max_qty provided -> updated directly on crm_inventory_stock
+      //     (thresholds are settings, NOT stock movements).
+      //   count + thresholds in one item are applied together.
+      if (p === "/api/shop/stock" && request.method === "POST") {
+        const body = await request.json();
+        const items = Array.isArray(body.items) ? body.items : null;
+        if (!items) return json({ error: "items array required" }, 400);
+        const OFFICE_OPERATOR = 8; // crm_users.id — Warehouse Manager
+        const operator = body.created_by ?? OFFICE_OPERATOR;
+        const WAREHOUSE_ID = 1;
+        const num = (v) => (v != null && v !== "" ? Number(v) : undefined);
+
+        const results = [];
+        for (const it of items) {
+          const mid = it.material_id;
+          try {
+            if (mid == null) throw new Error("material_id required");
+            const row = await env.DB.prepare(
+              `SELECT id, on_hand, min_qty, max_qty FROM crm_inventory_stock
+                WHERE location_id = ? AND material_id = ?`
+            ).bind(WAREHOUSE_ID, mid).first();
+            if (!row) throw new Error("no shop stock row");
+
+            const countVal = num(it.on_hand);          // undefined if not counting
+            const hasCount = countVal !== undefined;
+            const newMin = num(it.min_qty) ?? row.min_qty;
+            const newMax = num(it.max_qty) ?? row.max_qty;
+            const newOnHand = hasCount ? countVal : (row.on_hand ?? 0);
+            if (hasCount && !Number.isFinite(newOnHand)) throw new Error("on_hand not a number");
+            if (!Number.isFinite(newMin) || !Number.isFinite(newMax)) throw new Error("min/max not a number");
+
+            const delta = newOnHand - (row.on_hand ?? 0);
+            const countChanged = hasCount && delta !== 0;       // movement only when it moved
+            const minMaxChanged = newMin !== row.min_qty || newMax !== row.max_qty;
+
+            if (!hasCount && !minMaxChanged) {
+              results.push({ material_id: mid, result: "unchanged",
+                on_hand: row.on_hand, min_qty: row.min_qty, max_qty: row.max_qty });
+              continue;
+            }
+
+            // One UPDATE carries on_hand + thresholds (+ last_counted when a
+            // count was taken, even if the value confirmed unchanged).
+            const stamp = hasCount ? ", last_counted = datetime('now')" : "";
+            const upd = env.DB.prepare(
+              `UPDATE crm_inventory_stock
+                  SET on_hand = ?, min_qty = ?, max_qty = ?${stamp},
+                      modified_at = datetime('now')
+                WHERE id = ?`
+            ).bind(newOnHand, newMin, newMax, row.id);
+
+            if (countChanged) {
+              await env.DB.batch([
+                upd,
+                env.DB.prepare(
+                  `INSERT INTO crm_inventory_movements
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                   VALUES (?,?,?,?,?,?,?)`
+                ).bind(mid, WAREHOUSE_ID, delta, "count_adjust", null, "shop count", operator),
+              ]);
+            } else {
+              await upd.run();
+            }
+
+            results.push({
+              material_id: mid,
+              result: hasCount ? "counted" : "updated",
+              delta: countChanged ? delta : 0,
+              on_hand: newOnHand, min_qty: newMin, max_qty: newMax,
+            });
+          } catch (e) {
+            results.push({ material_id: mid, result: "failed", error: String(e.message || e) });
+          }
+        }
+
+        return json({ location_id: WAREHOUSE_ID, results });
+      }
+
       return json({ error: "not found" }, 404);
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);

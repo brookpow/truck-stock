@@ -727,7 +727,7 @@ export default {
         if (!all) where.push("is_active = 1");
         if (q) where.push("(name LIKE ? OR emco_sku LIKE ? OR code LIKE ?)");
         const stmt = env.DB.prepare(
-          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active
+          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max
              FROM crm_materials
             ${where.length ? "WHERE " + where.join(" AND ") : ""}
             ORDER BY category, name`
@@ -745,14 +745,16 @@ export default {
         const par = b.par != null && b.par !== "" ? Number(b.par) : null;
 
         // Primary write: the catalog row (id is AUTOINCREMENT).
+        const numOr = (v, d) => (v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : d);
         const ins = await env.DB.prepare(
           `INSERT INTO crm_materials
-             (name, category, cost, price, emco_sku, code, bin_location, unit, subcategory, search_terms)
-           VALUES (?,?,?,?,?,?,?,?,?,?)`
+             (name, category, cost, price, emco_sku, code, bin_location, unit, subcategory, search_terms, default_min, default_max)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
         ).bind(
           name, category, Number(b.cost) || 0, Number(b.price) || 0,
           b.emco_sku || null, b.code || null, b.bin_location || null,
-          b.unit || null, b.subcategory || null, b.search_terms || null
+          b.unit || null, b.subcategory || null, b.search_terms || null,
+          numOr(b.default_min, 2), numOr(b.default_max, 10)
         ).run();
         const id = ins.meta?.last_row_id ?? null;
 
@@ -801,7 +803,7 @@ export default {
       if (catMatch && request.method === "PATCH") {
         const id = catMatch[1];
         const b = await request.json();
-        const fields = ["name","category","cost","price","emco_sku","code","bin_location","unit","subcategory","search_terms","is_active"];
+        const fields = ["name","category","cost","price","emco_sku","code","bin_location","unit","subcategory","search_terms","is_active","default_min","default_max"];
         const sets = []; const binds = [];
         for (const f of fields) {
           if (b[f] === undefined) continue;
@@ -810,7 +812,7 @@ export default {
           }
           sets.push(`${f} = ?`);
           binds.push(
-            ["cost","price","is_active"].includes(f) ? Number(b[f])
+            ["cost","price","is_active","default_min","default_max"].includes(f) ? Number(b[f])
               : (b[f] === null ? null : String(b[f]))
           );
         }
@@ -839,7 +841,7 @@ export default {
           await updateStmt.run();
         }
         const row = await env.DB.prepare(
-          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active
+          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max
              FROM crm_materials WHERE id=?`
         ).bind(id).first();
         return json({ ok: true, item: row, cost_logged: costChanging });

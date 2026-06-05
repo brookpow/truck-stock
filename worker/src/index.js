@@ -938,6 +938,239 @@ export default {
         });
       }
 
+      // --- 8. EMCO reorder cycle (phase 3) -------------------------------
+      // Statuses are CHECK-constrained: Draft | Sent | Partial | Received | Cancelled.
+
+      // 8a. GET /api/reorder/suggested — the order list with NO double-ordering.
+      //   raw_short      = max_qty - on_hand (shop, loc 1)
+      //   already_on_order = SUM(qty_ordered - qty_received) over this material's
+      //                      lines on Sent/Partial POs (outstanding on order)
+      //   net_need       = raw_short - already_on_order   (only return > 0)
+      if (p === "/api/reorder/suggested" && request.method === "GET") {
+        const rows = (await env.DB.prepare(
+          `SELECT s.material_id, m.name, m.emco_sku, m.cost, s.on_hand, s.max_qty,
+                  (s.max_qty - s.on_hand) AS raw_short,
+                  COALESCE((
+                    SELECT SUM(pi.qty_ordered - pi.qty_received)
+                      FROM crm_inventory_po_items pi
+                      JOIN crm_inventory_purchase_orders po ON po.id = pi.po_id
+                     WHERE pi.material_id = s.material_id
+                       AND po.status IN ('Sent','Partial')
+                  ), 0) AS already_on_order
+             FROM crm_inventory_stock s
+             JOIN crm_materials m ON m.id = s.material_id
+            WHERE s.location_id = 1 AND s.on_hand < s.max_qty AND m.is_active = 1
+            ORDER BY m.category, m.name`
+        ).all()).results || [];
+        const items = rows
+          .map((r) => ({ ...r, net_need: r.raw_short - (r.already_on_order || 0) }))
+          .filter((r) => r.net_need > 0);
+        return json({ items });
+      }
+
+      // 8b. POST /api/reorder/po — get-or-create the single open Draft PO and
+      //   (re)assemble its lines from the body { items:[{material_id, qty_ordered}] }.
+      //   unit_cost is frozen from the catalog at assembly time for the PO total.
+      if (p === "/api/reorder/po" && request.method === "POST") {
+        const b = await request.json();
+        const items = Array.isArray(b.items) ? b.items : [];
+        let po = await env.DB.prepare(
+          `SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`
+        ).first();
+        if (!po) {
+          const ins = await env.DB.prepare(
+            `INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by) VALUES (?, 'Draft', ?)`
+          ).bind(b.vendor_name || "EMCO", b.created_by ?? 8).run();
+          po = { id: ins.meta?.last_row_id };
+        }
+        const poId = po.id;
+        // Dedupe by material_id (last positive qty wins).
+        const byMid = new Map();
+        for (const it of items) {
+          const q = Number(it.qty_ordered);
+          if (it.material_id != null && q > 0) byMid.set(it.material_id, q);
+        }
+        const mids = [...byMid.keys()];
+        const costMap = {};
+        for (let i = 0; i < mids.length; i += 100) {
+          const chunk = mids.slice(i, i + 100);
+          const ph = chunk.map(() => "?").join(",");
+          const cr = (await env.DB.prepare(
+            `SELECT id, cost, emco_sku FROM crm_materials WHERE id IN (${ph})`
+          ).bind(...chunk).all()).results || [];
+          for (const c of cr) costMap[c.id] = c;
+        }
+        const stmts = [env.DB.prepare(`DELETE FROM crm_inventory_po_items WHERE po_id=?`).bind(poId)];
+        let total = 0;
+        for (const [mid, qty] of byMid) {
+          const cost = costMap[mid]?.cost ?? 0;
+          const lineTotal = Math.round(cost * qty * 100) / 100;
+          total += lineTotal;
+          stmts.push(env.DB.prepare(
+            `INSERT INTO crm_inventory_po_items
+               (po_id, material_id, qty_ordered, qty_received, vendor_part_number, unit_cost, line_total)
+             VALUES (?,?,?,0,?,?,?)`
+          ).bind(poId, mid, qty, costMap[mid]?.emco_sku ?? null, cost, lineTotal));
+        }
+        total = Math.round(total * 100) / 100;
+        stmts.push(env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(total, poId));
+        await env.DB.batch(stmts);
+        const lines = (await env.DB.prepare(
+          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku,
+                  pi.qty_ordered, pi.unit_cost, pi.line_total
+             FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
+            WHERE pi.po_id=? ORDER BY m.name`
+        ).bind(poId).all()).results || [];
+        return json({ ok: true, po_id: poId, status: "Draft", total, lines });
+      }
+
+      // 8c. POST /api/reorder/po/:id/send — Draft -> Sent, stamp sent_at.
+      const sendMatch = p.match(/^\/api\/reorder\/po\/(\d+)\/send$/);
+      if (sendMatch && request.method === "POST") {
+        const poId = sendMatch[1];
+        const po = await env.DB.prepare(`SELECT id, status FROM crm_inventory_purchase_orders WHERE id=?`).bind(poId).first();
+        if (!po) return json({ error: "not found" }, 404);
+        if (po.status !== "Draft") return json({ error: `PO is ${po.status}; only a Draft can be sent` }, 409);
+        const cnt = await env.DB.prepare(`SELECT COUNT(*) AS n FROM crm_inventory_po_items WHERE po_id=?`).bind(poId).first();
+        if ((cnt?.n || 0) === 0) return json({ error: "PO has no lines" }, 400);
+        await env.DB.prepare(
+          `UPDATE crm_inventory_purchase_orders SET status='Sent', sent_at=datetime('now') WHERE id=?`
+        ).bind(poId).run();
+        return json({ ok: true, po_id: Number(poId), status: "Sent" });
+      }
+
+      // 8d. POST /api/reorder/po/:id/receive — body { lines:[{line_id, qty_received}] }
+      //   Per line, ATOMIC + non-fatal: add qty_received to the line's running
+      //   total AND to shop (loc 1) on_hand via a po_receive movement. Then set
+      //   the PO to Received (all lines fulfilled) or Partial (some outstanding).
+      const recvMatch = p.match(/^\/api\/reorder\/po\/(\d+)\/receive$/);
+      if (recvMatch && request.method === "POST") {
+        const poId = recvMatch[1];
+        const b = await request.json();
+        const receipts = Array.isArray(b.lines) ? b.lines : [];
+        const po = await env.DB.prepare(`SELECT id, status FROM crm_inventory_purchase_orders WHERE id=?`).bind(poId).first();
+        if (!po) return json({ error: "not found" }, 404);
+        if (!["Sent", "Partial"].includes(po.status)) {
+          return json({ error: `PO is ${po.status}; only Sent/Partial can be received` }, 409);
+        }
+        const WAREHOUSE_ID = 1;
+        const results = [];
+        for (const rc of receipts) {
+          const lineId = rc.line_id;
+          const recvQty = Number(rc.qty_received);
+          try {
+            if (lineId == null) throw new Error("line_id required");
+            if (!(recvQty > 0)) throw new Error("qty_received must be > 0");
+            const line = await env.DB.prepare(
+              `SELECT id, material_id, qty_ordered, qty_received FROM crm_inventory_po_items WHERE id=? AND po_id=?`
+            ).bind(lineId, poId).first();
+            if (!line) throw new Error("line not found on this PO");
+            const srow = await env.DB.prepare(
+              `SELECT id, on_hand FROM crm_inventory_stock WHERE location_id=? AND material_id=?`
+            ).bind(WAREHOUSE_ID, line.material_id).first();
+            if (!srow) throw new Error("no shop stock row");
+            const newReceived = (line.qty_received ?? 0) + recvQty;
+            const newOnHand = (srow.on_hand ?? 0) + recvQty;
+            await env.DB.batch([
+              env.DB.prepare(`UPDATE crm_inventory_po_items SET qty_received=? WHERE id=?`).bind(newReceived, line.id),
+              env.DB.prepare(
+                `UPDATE crm_inventory_stock SET on_hand=?, last_restocked=datetime('now'), modified_at=datetime('now') WHERE id=?`
+              ).bind(newOnHand, srow.id),
+              env.DB.prepare(
+                `INSERT INTO crm_inventory_movements
+                   (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                 VALUES (?,?,?,?,?,?,?)`
+              ).bind(line.material_id, WAREHOUSE_ID, recvQty, "po_receive", Number(poId), `received PO #${poId}`, b.created_by ?? 8),
+            ]);
+            results.push({
+              line_id: line.id, material_id: line.material_id, received: recvQty,
+              qty_received_total: newReceived, qty_ordered: line.qty_ordered,
+              outstanding: Math.max(0, line.qty_ordered - newReceived),
+            });
+          } catch (e) {
+            results.push({ line_id: lineId, result: "failed", error: String(e.message || e) });
+          }
+        }
+        // Recompute PO status from the actual line state.
+        const allLines = (await env.DB.prepare(
+          `SELECT qty_ordered, qty_received FROM crm_inventory_po_items WHERE po_id=?`
+        ).bind(poId).all()).results || [];
+        const anyOutstanding = allLines.some((l) => (l.qty_received ?? 0) < l.qty_ordered);
+        const newStatus = anyOutstanding ? "Partial" : "Received";
+        if (newStatus === "Received") {
+          await env.DB.prepare(
+            `UPDATE crm_inventory_purchase_orders SET status='Received', received_at=datetime('now') WHERE id=?`
+          ).bind(poId).run();
+        } else {
+          await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET status='Partial' WHERE id=?`).bind(poId).run();
+        }
+        return json({ ok: true, po_id: Number(poId), status: newStatus, results });
+      }
+
+      // 8f. GET /api/reorder/po/current — the open Draft PO with its lines (or null).
+      if (p === "/api/reorder/po/current" && request.method === "GET") {
+        const po = await env.DB.prepare(
+          `SELECT id, status, total, created_at FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`
+        ).first();
+        if (!po) return json({ po: null });
+        const lines = (await env.DB.prepare(
+          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku, pi.qty_ordered, pi.unit_cost, pi.line_total
+             FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
+            WHERE pi.po_id=? ORDER BY m.name`
+        ).bind(po.id).all()).results || [];
+        return json({ po: { ...po, lines } });
+      }
+
+      // 8g. GET /api/reorder/pos?status=Sent,Partial — PO list (newest first).
+      if (p === "/api/reorder/pos" && request.method === "GET") {
+        const status = url.searchParams.get("status");
+        const arr = status ? status.split(",").map((s) => s.trim()).filter(Boolean) : null;
+        const where = arr ? `WHERE status IN (${arr.map(() => "?").join(",")})` : "";
+        const stmt = env.DB.prepare(
+          `SELECT po.id, po.status, po.total, po.created_at, po.sent_at, po.received_at,
+                  (SELECT COUNT(*) FROM crm_inventory_po_items WHERE po_id=po.id) AS line_count,
+                  (SELECT COUNT(*) FROM crm_inventory_po_items WHERE po_id=po.id AND qty_received < qty_ordered) AS outstanding_lines
+             FROM crm_inventory_purchase_orders po ${where}
+            ORDER BY po.id DESC`
+        );
+        const r = await (arr ? stmt.bind(...arr) : stmt).all();
+        return json({ pos: r.results || [] });
+      }
+
+      // 8h. GET /api/reorder/po/:id — one PO with ALL its lines (incl. received).
+      const poGetMatch = p.match(/^\/api\/reorder\/po\/(\d+)$/);
+      if (poGetMatch && request.method === "GET") {
+        const id = poGetMatch[1];
+        const po = await env.DB.prepare(
+          `SELECT id, status, total, created_at, sent_at, received_at FROM crm_inventory_purchase_orders WHERE id=?`
+        ).bind(id).first();
+        if (!po) return json({ error: "not found" }, 404);
+        const lines = (await env.DB.prepare(
+          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku,
+                  pi.qty_ordered, pi.qty_received, (pi.qty_ordered - pi.qty_received) AS outstanding,
+                  pi.unit_cost, pi.line_total
+             FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
+            WHERE pi.po_id=? ORDER BY m.name`
+        ).bind(id).all()).results || [];
+        return json({ po: { ...po, lines } });
+      }
+
+      // 8e. GET /api/reorder/backorders — outstanding lines on Sent/Partial POs.
+      if (p === "/api/reorder/backorders" && request.method === "GET") {
+        const rows = (await env.DB.prepare(
+          `SELECT pi.id AS line_id, pi.po_id, pi.material_id, m.name, m.emco_sku,
+                  pi.qty_ordered, pi.qty_received,
+                  (pi.qty_ordered - pi.qty_received) AS outstanding,
+                  po.status, po.sent_at
+             FROM crm_inventory_po_items pi
+             JOIN crm_inventory_purchase_orders po ON po.id = pi.po_id
+             JOIN crm_materials m ON m.id = pi.material_id
+            WHERE po.status IN ('Sent','Partial') AND pi.qty_received < pi.qty_ordered
+            ORDER BY po.sent_at, m.name`
+        ).all()).results || [];
+        return json({ items: rows });
+      }
+
       return json({ error: "not found" }, 404);
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);

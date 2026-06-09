@@ -62,20 +62,66 @@ function PickTech({ onPick }) {
   );
 }
 
-// ---- Screen 2: today's jobs (with manual fallback) -----------------------
+// ---- Screen 2: today's jobs (current / upcoming + manual fallback) --------
+// The endpoint returns one row per job with a per-appointment status. We split
+// the on-site (Working) jobs out as "Current" and highlight them; Dispatched
+// (en route) + Scheduled fall under "Upcoming". Tapping any job opens Capture.
+const STATUS_BADGE = {
+  Working:    { label: "● On site", color: "#1d7a4d", bg: "#e6f5ed" },  // green
+  Dispatched: { label: "En route",  color: "#6b3fa0", bg: "#efe7fb" },  // purple
+  Scheduled:  { label: "Scheduled", color: "#555",    bg: "#eee" },     // grey
+  Done:       { label: "Done",      color: "#8a6a00", bg: "#fbf0c8" },  // yellow (finished)
+  Paused:     { label: "Paused",    color: "#8a6a00", bg: "#fbf0c8" },  // yellow (awaiting review)
+};
+// Map the worker's job shape onto what Capture expects (id / num / cust),
+// carrying status + address + start for the list UI.
+const normalizeJob = (j) => ({
+  id: j.job_id, num: j.job_number, cust: j.customer,
+  addr: j.address, status: j.status, start: j.start_date,
+});
+const fmtTime = (iso) => {
+  try {
+    return new Date(iso).toLocaleTimeString("en-US", {
+      timeZone: "America/Vancouver", hour: "numeric", minute: "2-digit",
+    });
+  } catch { return ""; }
+};
+
+function JobCard({ job, onTap, current, recent }) {
+  const b = STATUS_BADGE[job.status] || STATUS_BADGE.Scheduled;
+  const rowStyle = current ? styles.jobRowCurrent : recent ? styles.jobRowRecent : styles.jobRow;
+  return (
+    <button style={rowStyle} onClick={onTap}>
+      <div style={styles.jobRowTop}>
+        <span style={styles.jobCust}>{job.cust || ("Job " + job.num)}</span>
+        <span style={{ ...styles.badge, color: b.color, background: b.bg }}>{b.label}</span>
+      </div>
+      <div style={styles.muted}>
+        {job.addr || ("Job " + job.num)}{job.start ? " · " + fmtTime(job.start) : ""}
+      </div>
+      {current && <div style={styles.tapHint}>tap to log materials</div>}
+      {recent && <div style={styles.recentHint}>tap to add a forgotten material</div>}
+    </button>
+  );
+}
+
 function Jobs({ tech, onSignOut }) {
-  const [jobs, setJobs] = useState(null);
+  const [data, setData] = useState(null);     // { jobs:[normalized], date } | null
   const [manual, setManual] = useState(false);
   const [manualId, setManualId] = useState("");
   const [active, setActive] = useState(null); // selected job
+  const [err, setErr] = useState(false);
 
   useEffect(() => {
+    setData(null); setErr(false);
     getTodaysJobs(tech.st_tech_id)
       .then((r) => {
-        setJobs(r.jobs || []);
-        if (r.fallback === "manual" || (r.jobs || []).length === 0) setManual(true);
+        const jobs = (r.jobs || []).map(normalizeJob);
+        const recent = (r.recent || []).map(normalizeJob);
+        setData({ jobs, recent, date: r.date });
+        if (r.fallback === "manual" || jobs.length === 0) setManual(true);
       })
-      .catch(() => setManual(true));
+      .catch(() => { setData({ jobs: [], recent: [] }); setManual(true); setErr(true); });
   }, [tech]);
 
   function openManual() {
@@ -84,12 +130,17 @@ function Jobs({ tech, onSignOut }) {
       alert("Job ID must be the numeric ServiceTitan job number.");
       return;
     }
-    setActive({ id: Number(id), num: "JOB-" + id, cust: "Manual entry" });
+    setActive({ id: Number(id), num: id, cust: "Manual entry" });
   }
 
   if (active) {
     return <Capture tech={tech} job={active} onBack={() => setActive(null)} />;
   }
+
+  const jobs = data ? data.jobs : null;
+  const recent = (data && data.recent) || [];
+  const working = (jobs || []).filter((j) => j.status === "Working");
+  const upcoming = (jobs || []).filter((j) => j.status !== "Working");
 
   return (
     <div style={styles.screen}>
@@ -99,13 +150,32 @@ function Jobs({ tech, onSignOut }) {
       </div>
       <h1 style={styles.h1}>Today's jobs</h1>
 
-      {jobs && jobs.map((j) => (
-        <button key={j.id} style={styles.jobRow} onClick={() => setActive(j)}>
-          <div style={{ fontWeight: 500, fontSize: 16 }}>{j.cust || j.num}</div>
-          <div style={styles.muted}>{j.addr || j.num}</div>
-        </button>
-      ))}
+      {!jobs && !err && <div style={styles.muted}>Loading jobs…</div>}
 
+      {working.length > 0 && (
+        <>
+          <div style={styles.sectionLabel}>Current</div>
+          {working.map((j) => <JobCard key={j.id} job={j} current onTap={() => setActive(j)} />)}
+        </>
+      )}
+      {upcoming.length > 0 && (
+        <>
+          <div style={styles.sectionLabel}>Upcoming</div>
+          {upcoming.map((j) => <JobCard key={j.id} job={j} onTap={() => setActive(j)} />)}
+        </>
+      )}
+      {jobs && jobs.length === 0 && !err && (
+        <div style={styles.muted}>No jobs assigned to you for today.</div>
+      )}
+      {err && <div style={styles.error}>Couldn't load today's jobs — enter the job number below.</div>}
+
+      {/* Manual entry: auto-shown when there are no jobs / fallback="manual",
+          and reachable via the toggle for a job that isn't on the list. */}
+      {!manual && jobs && jobs.length > 0 && (
+        <button style={styles.manualToggle} onClick={() => setManual(true)}>
+          Different job? Enter a number
+        </button>
+      )}
       {manual && (
         <div style={{ marginTop: 16 }}>
           <p style={styles.sub}>
@@ -121,7 +191,15 @@ function Jobs({ tech, onSignOut }) {
           <button style={styles.primary} onClick={openManual}>Open job</button>
         </div>
       )}
-      {!jobs && !manual && <div style={styles.muted}>Loading jobs…</div>}
+
+      {/* Recent / finished tier — de-emphasized, below everything. Paused/Done
+          jobs from the last 3 days; tap to log a forgotten material. */}
+      {recent.length > 0 && (
+        <div style={styles.recentSection}>
+          <div style={styles.sectionLabel}>Recently finished · last 3 days</div>
+          {recent.map((j) => <JobCard key={j.id} job={j} recent onTap={() => setActive(j)} />)}
+        </div>
+      )}
     </div>
   );
 }
@@ -406,6 +484,16 @@ const styles = {
   linkBtn: { background: "none", border: "none", color: "#185fa5", fontSize: 14, padding: 4, cursor: "pointer" },
   bigRow: { display: "block", width: "100%", textAlign: "left", padding: "16px", fontSize: 17, marginBottom: 8, border: "1px solid #ddd", borderRadius: 10, background: "#fff", cursor: "pointer" },
   jobRow: { display: "block", width: "100%", textAlign: "left", padding: "14px", marginBottom: 8, border: "1px solid #ddd", borderRadius: 10, background: "#fff", cursor: "pointer" },
+  jobRowCurrent: { display: "block", width: "100%", textAlign: "left", padding: "14px", marginBottom: 8, border: "2px solid #1d9e75", borderRadius: 10, background: "#f1faf5", cursor: "pointer" },
+  jobRowTop: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 },
+  jobCust: { fontWeight: 600, fontSize: 16, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  badge: { fontSize: 12, fontWeight: 600, padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap", flex: "none" },
+  tapHint: { fontSize: 12, color: "#1d7a4d", marginTop: 4 },
+  sectionLabel: { fontSize: 12, fontWeight: 600, color: "#999", textTransform: "uppercase", letterSpacing: "0.04em", margin: "14px 0 6px" },
+  jobRowRecent: { display: "block", width: "100%", textAlign: "left", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fafafa", cursor: "pointer", opacity: 0.85 },
+  recentSection: { marginTop: 22, paddingTop: 6, borderTop: "1px solid #eee" },
+  recentHint: { fontSize: 12, color: "#8a6a00", marginTop: 4 },
+  manualToggle: { background: "none", border: "none", color: "#185fa5", fontSize: 14, padding: "10px 0", marginTop: 6, cursor: "pointer", textAlign: "left", display: "block" },
   input: { width: "100%", height: 48, fontSize: 16, padding: "0 12px", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, marginBottom: 10 },
   primary: { width: "100%", height: 48, fontSize: 16, fontWeight: 500, background: "#185fa5", color: "#fff", border: "none", borderRadius: 10, cursor: "pointer" },
   resultRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fff" },

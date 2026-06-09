@@ -28,6 +28,24 @@ const cors = () => ({
   "Access-Control-Allow-Headers": "Content-Type",
 });
 
+// Pacific (America/Vancouver) calendar day as UTC bounds, DST-correct.
+// crm_st_appointments.start_date is stored UTC ISO ("2026-06-09T15:00:00Z");
+// a tech's "today" is the Pacific day, so we return [midnight, next-midnight)
+// Pacific expressed in UTC for a simple range filter on start_date.
+function pacificDayBoundsUTC(now = new Date()) {
+  const dayStr = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Vancouver" }).format(now);
+  const wall = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Vancouver", hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(now).reduce((a, x) => ((a[x.type] = x.value), a), {});
+  const asIfUTC = Date.UTC(+wall.year, +wall.month - 1, +wall.day, +wall.hour % 24, +wall.minute, +wall.second);
+  const offsetMs = asIfUTC - now.getTime();                 // -7h PDT / -8h PST
+  const startMs = Date.parse(`${dayStr}T00:00:00Z`) - offsetMs;
+  const iso = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  return { dayStr, start: iso(startMs), end: iso(startMs + 86400000) };
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors() });
@@ -54,15 +72,79 @@ export default {
         return json(r.results || []);
       }
 
-      // --- 0b. Today's jobs for a tech (ServiceTitan-fed) -----------------
-      // PLACEHOLDER: the real version calls the ServiceTitan appointments API
-      // by st_tech_id for today. That requires ST secrets + the appointment
-      // query, which we tune against real data. For now this returns an empty
-      // list so the app falls back to manual job-id entry and stays usable.
+      // --- 0b. Today's jobs for a tech (ServiceTitan-fed via D1) ----------
+      // TWO TIERS, two date windows:
+      //   ACTIVE (jobs[]):  the tech's appointment-assignments -> jobs for TODAY
+      //     (Pacific) where the appointment is Working/Dispatched/Scheduled and
+      //     the job isn't finished. Ranked Working -> Dispatched -> Scheduled (the
+      //     tech's status on the job today). A "Working" appt is always included
+      //     even if its start fell outside today's window (they're on it now).
+      //   RECENT (recent[]): the tech's jobs visited in the LAST 3 DAYS whose job
+      //     status is Completed or paused (tech-finished / awaiting office review),
+      //     so a forgotten material can still be logged. De-emphasized in the UI.
+      // The two tiers are mutually exclusive (active excludes finished job
+      // statuses; recent only includes them). ST data lands in D1 via the
+      // crm-worker */10 incremental sync. Empty active list -> manual fallback.
       if (p === "/api/techs/jobs" && request.method === "GET") {
-        // const stTechId = url.searchParams.get("st_tech_id");
-        // TODO: fetch ST appointments for stTechId, today, map to jobs.
-        return json({ jobs: [], fallback: "manual" });
+        const tid = parseInt(url.searchParams.get("st_tech_id") || "", 10);
+        if (!tid) return json({ jobs: [], recent: [], fallback: "manual" });
+        const { dayStr, start, end } = pacificDayBoundsUTC();
+        const recentStart = new Date(Date.parse(start) - 3 * 86400000)
+          .toISOString().replace(/\.\d{3}Z$/, "Z");                 // today's Pacific midnight, -3 days
+        const addr =
+          `TRIM(COALESCE(c.address_street,'') ||
+                CASE WHEN c.address_city IS NOT NULL THEN ', ' || c.address_city ELSE '' END)`;
+        const [activeRes, recentRes] = await env.DB.batch([
+          // ACTIVE — today, active appointment status, job not finished.
+          env.DB.prepare(
+            `SELECT aa.job_id, j.job_number, j.status AS job_status, c.name AS customer,
+                    ${addr} AS address,
+                    MIN(CASE ap.status WHEN 'Working' THEN 1 WHEN 'Dispatched' THEN 2
+                                       WHEN 'Scheduled' THEN 3 ELSE 4 END) AS status_rank,
+                    MIN(ap.start_date) AS start_date,
+                    COUNT(DISTINCT aa.appointment_id) AS appt_count
+               FROM crm_st_appointment_assignments aa
+               JOIN crm_st_appointments ap ON ap.id = aa.appointment_id
+               JOIN crm_st_jobs j           ON j.id = aa.job_id
+               LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+              WHERE aa.technician_id = ?1
+                AND ap.status IN ('Working','Dispatched','Scheduled')
+                AND ((ap.start_date >= ?2 AND ap.start_date < ?3) OR ap.status = 'Working')
+                AND j.status NOT IN ('Completed','Canceled')
+                AND LOWER(j.status) != 'paused'
+              GROUP BY aa.job_id, j.job_number, j.status, c.name, c.address_street, c.address_city
+              ORDER BY status_rank, start_date`
+          ).bind(tid, start, end),
+          // RECENT — finished (Completed/paused) jobs visited in the last 3 days.
+          env.DB.prepare(
+            `SELECT aa.job_id, j.job_number, j.status AS job_status, c.name AS customer,
+                    ${addr} AS address,
+                    MAX(ap.start_date) AS start_date,
+                    COUNT(DISTINCT aa.appointment_id) AS appt_count
+               FROM crm_st_appointment_assignments aa
+               JOIN crm_st_appointments ap ON ap.id = aa.appointment_id
+               JOIN crm_st_jobs j           ON j.id = aa.job_id
+               LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+              WHERE aa.technician_id = ?1
+                AND (j.status = 'Completed' OR LOWER(j.status) = 'paused')
+                AND ap.start_date >= ?2
+              GROUP BY aa.job_id, j.job_number, j.status, c.name, c.address_street, c.address_city
+              ORDER BY start_date DESC`
+          ).bind(tid, recentStart),
+        ]);
+        const RANK = { 1: "Working", 2: "Dispatched", 3: "Scheduled" };
+        const jobs = (activeRes.results || []).map((row) => ({
+          job_id: row.job_id, job_number: row.job_number, customer: row.customer,
+          address: row.address || null, status: RANK[row.status_rank] || "Scheduled",
+          start_date: row.start_date, appt_count: row.appt_count, job_status: row.job_status,
+        }));
+        const recent = (recentRes.results || []).map((row) => ({
+          job_id: row.job_id, job_number: row.job_number, customer: row.customer,
+          address: row.address || null,
+          status: String(row.job_status).toLowerCase() === "paused" ? "Paused" : "Done",
+          start_date: row.start_date, appt_count: row.appt_count, job_status: row.job_status,
+        }));
+        return json({ st_tech_id: tid, date: dayStr, jobs, recent, fallback: jobs.length ? null : "manual" });
       }
 
       // --- 0c. Van roster for the office UI -------------------------------

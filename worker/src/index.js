@@ -613,6 +613,181 @@ export default {
         });
       }
 
+      // --- 4c. AI receipt / packing-slip scan (READ-ONLY — logs nothing) -
+      // POST /api/jobs/:jobId/scan-receipt   Body: { image_base64, media_type }
+      // Ported from CRM_BUILD inventory.js: Claude vision extracts supplier +
+      // line items + totals; we fuzzy-match each line to the catalog and return
+      // it for the tech to review. NOTHING is written here — the confirm step
+      // (POST .../purchases) commits only what the tech approves. No auth gate
+      // (truck-stock is open). Needs ANTHROPIC_API_KEY as a worker secret.
+      const scanMatch = p.match(/^\/api\/jobs\/([^/]+)\/scan-receipt$/);
+      if (scanMatch && request.method === "POST") {
+        if (!env.ANTHROPIC_API_KEY) {
+          return json({ error: "missing_api_key",
+            message: "Set ANTHROPIC_API_KEY via `wrangler secret put ANTHROPIC_API_KEY`." }, 500);
+        }
+        const b = await request.json().catch(() => ({}));
+        if (!b.image_base64) return json({ error: "missing_image" }, 400);
+        const mediaType = b.media_type || "image/jpeg";
+
+        const prompt = `Extract all line items from this receipt or packing slip. Return JSON ONLY, no markdown fences, no prose. Schema:
+{
+  "supplier": "detected supplier name or empty string",
+  "items": [
+    {"description": "item name", "quantity": 1, "unit_cost": 0.00, "total": 0.00}
+  ],
+  "subtotal": 0.00,
+  "tax": 0.00,
+  "total": 0.00
+}
+If something isn't visible, use 0 for numbers and "" for strings. Do not hallucinate values.`;
+
+        let aiResp;
+        try {
+          aiResp = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-api-key": env.ANTHROPIC_API_KEY,
+              "anthropic-version": "2023-06-01",
+            },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 1500,
+              messages: [{
+                role: "user",
+                content: [
+                  { type: "image", source: { type: "base64", media_type: mediaType, data: b.image_base64 } },
+                  { type: "text", text: prompt },
+                ],
+              }],
+            }),
+          });
+        } catch (e) {
+          return json({ error: "anthropic_network", message: String(e?.message || e) }, 502);
+        }
+        if (!aiResp.ok) {
+          const errText = await aiResp.text().catch(() => "");
+          return json({ error: "anthropic_http", status: aiResp.status, message: errText.slice(0, 500) }, 502);
+        }
+        const data = await aiResp.json().catch(() => null);
+        const text = data?.content?.[0]?.text || "";
+
+        // Claude occasionally wraps in ```json fences even when told not to.
+        let parsed = null;
+        try {
+          const stripped = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+          parsed = JSON.parse(stripped);
+        } catch (_) {
+          const m = text.match(/\{[\s\S]*\}/);
+          if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
+        }
+        if (!parsed) return json({ error: "parse_failed", raw: text.slice(0, 500) }, 502);
+
+        // Fuzzy-match each line to a catalog material (name/code/emco_sku/search_terms).
+        const items = Array.isArray(parsed.items) ? parsed.items : [];
+        for (const it of items) {
+          const desc = String(it.description || "").trim();
+          if (!desc) { it.match = null; continue; }
+          const like = `%${desc.slice(0, 30)}%`;
+          const m = await env.DB.prepare(
+            `SELECT id, code, emco_sku, name, cost FROM crm_materials
+              WHERE is_active = 1
+                AND (name LIKE ? OR code LIKE ? OR emco_sku LIKE ? OR search_terms LIKE ?)
+              ORDER BY length(name) LIMIT 1`
+          ).bind(like, like, like, like).first();
+          it.match = m ? { id: m.id, name: m.name, code: m.code, emco_sku: m.emco_sku, cost: m.cost } : null;
+        }
+
+        return json({
+          ok: true,
+          job_id: scanMatch[1],
+          supplier: parsed.supplier || "",
+          items,                                  // each: {description, quantity, unit_cost, total, match}
+          subtotal: Number(parsed.subtotal || 0),
+          tax: Number(parsed.tax || 0),
+          total: Number(parsed.total || 0),
+        });
+      }
+
+      // --- 4d. Commit a confirmed receipt (NO van deduction) -------------
+      // POST /api/jobs/:jobId/purchases   Body: {
+      //   tech_id, supplier, total, description?, job_number?, receipt_photo_url?,
+      //   items: [{ description, quantity, unit_cost, total, material_id?, log_to_materials? }]
+      // }
+      // Writes ONE crm_job_purchases row (the receipt header). For each item the
+      // tech matched AND flagged (material_id set AND log_to_materials===true),
+      // also writes a crm_job_materials line at the frozen cost — but NEVER
+      // touches van stock (no job_usage movement). A receipt is purchase cost,
+      // not a van draw-down.
+      const purchMatch = p.match(/^\/api\/jobs\/([^/]+)\/purchases$/);
+      if (purchMatch && request.method === "POST") {
+        const jobId = purchMatch[1];
+        const b = await request.json().catch(() => ({}));
+        const supplier = (b.supplier || "").trim();
+        const total = Number(b.total);
+        if (!supplier) return json({ error: "supplier required" }, 400);
+        if (!Number.isFinite(total)) return json({ error: "total must be a number" }, 400);
+        if (b.tech_id == null) return json({ error: "tech_id required" }, 400);
+
+        const items = Array.isArray(b.items) ? b.items : [];
+        const description = (b.description && String(b.description).trim()) ||
+          items.map((i) => i.description).filter(Boolean).slice(0, 4).join(", ") || null;
+
+        // 1) Receipt header -> crm_job_purchases.
+        const ins = await env.DB.prepare(
+          `INSERT INTO crm_job_purchases
+             (job_id, job_number, supplier, receipt_total, description, receipt_photo_url, tech_id, truck_location_id)
+           VALUES (?,?,?,?,?,?,?,?)`
+        ).bind(
+          jobId,
+          b.job_number ?? String(jobId),
+          supplier,
+          total,
+          description,
+          b.receipt_photo_url ?? null,
+          b.tech_id,
+          b.truck_location_id ?? null
+        ).run();
+        const purchaseId = ins.meta?.last_row_id ?? null;
+
+        // 2) Optionally log matched lines to crm_job_materials — NO deduction.
+        const loggedLines = [];
+        for (const it of items) {
+          if (it.material_id == null || it.log_to_materials !== true) continue;
+          try {
+            const qty = Number(it.quantity) || 1;
+            // Freeze cost: prefer the receipt's unit_cost, else catalog cost.
+            let unitCost = Number(it.unit_cost);
+            if (!Number.isFinite(unitCost) || unitCost <= 0) {
+              const mat = await env.DB.prepare(`SELECT cost FROM crm_materials WHERE id = ?`).bind(it.material_id).first();
+              unitCost = mat ? (mat.cost ?? 0) : 0;
+            }
+            const lineTotal = unitCost * qty;
+            const mIns = await env.DB.prepare(
+              `INSERT INTO crm_job_materials
+                 (job_id, job_number, material_id, quantity, unit_cost, total_cost,
+                  tech_id, truck_location_id, notes, is_prepull)
+               VALUES (?,?,?,?,?,?,?,?,?,?)`
+            ).bind(jobId, b.job_number ?? String(jobId), it.material_id, qty, unitCost, lineTotal,
+              b.tech_id, null, `receipt purchase #${purchaseId}`, 0).run();
+            loggedLines.push({ material_id: it.material_id, line_id: mIns.meta?.last_row_id ?? null,
+              quantity: qty, unit_cost: unitCost, total_cost: lineTotal });
+          } catch (e) {
+            loggedLines.push({ material_id: it.material_id, error: String(e.message || e) });
+          }
+        }
+
+        return json({
+          ok: true,
+          job_id: jobId,
+          purchase_id: purchaseId,
+          supplier, receipt_total: total,
+          logged_to_materials: loggedLines,   // matched lines also recorded as job materials
+          deducted_van_stock: false,          // explicit: receipts never draw down the van
+        });
+      }
+
       // --- 5a. Replenishment list for a van ------------------------------
       // GET /api/restock/:locationId/list
       // The validated replenishment query: materials on this van below reorder

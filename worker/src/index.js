@@ -633,19 +633,90 @@ export default {
         return json({ location_id: Number(locationId) || locationId, items: r.results || [] });
       }
 
+      // --- 5a-bis. Van restock BY JOB ------------------------------------
+      // GET /api/restock/:locationId/by-job
+      // The usage that drew THIS van down since its last restock, grouped by the
+      // jobs that caused it. Source: crm_job_materials for the van's assigned
+      // tech, joined to crm_st_jobs/customers, restricted to lines that actually
+      // deducted from this van (a job_usage movement at this location) AND logged
+      // AFTER the van's most recent transfer_in (restock pull) — so each restock
+      // resets the list. Powers the office by-job review/correct section.
+      const byJobMatch = p.match(/^\/api\/restock\/([^/]+)\/by-job$/);
+      if (byJobMatch && request.method === "GET") {
+        const locationId = byJobMatch[1];
+        const loc = await env.DB.prepare(
+          `SELECT id, type, assigned_tech_id FROM crm_inventory_locations WHERE id = ?`
+        ).bind(locationId).first();
+        if (!loc) return json({ error: "location not found" }, 404);
+        if (loc.type !== "truck") return json({ error: "location is not a truck" }, 400);
+
+        // Anchor: the van's most recent restock pull (transfer_in). Usage since.
+        const lastRestock = await env.DB.prepare(
+          `SELECT MAX(created_at) AS ts FROM crm_inventory_movements
+            WHERE location_id = ? AND reason = 'transfer_in'`
+        ).bind(locationId).first();
+        const since = (lastRestock && lastRestock.ts) || "1970-01-01";
+
+        const rows = (await env.DB.prepare(
+          `SELECT jm.id AS line_id, jm.job_id, jm.material_id, m.name AS material, m.emco_sku,
+                  jm.quantity, jm.unit_cost, jm.total_cost, jm.created_at,
+                  j.job_number, j.status AS job_status,
+                  c.name AS customer, c.address_street, c.address_city
+             FROM crm_job_materials jm
+             JOIN crm_materials m ON m.id = jm.material_id
+             LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+            WHERE jm.tech_id = ?
+              AND jm.created_at > ?
+              AND EXISTS (SELECT 1 FROM crm_inventory_movements mv
+                           WHERE mv.reference_id = jm.id AND mv.reason = 'job_usage'
+                             AND mv.location_id = ?)
+            ORDER BY j.job_number, jm.created_at`
+        ).bind(loc.assigned_tech_id, since, locationId).all()).results || [];
+
+        // Group flat rows into jobs (GET order preserved).
+        const byJob = new Map();
+        for (const r of rows) {
+          const key = r.job_id ?? `unknown-${r.line_id}`;
+          if (!byJob.has(key)) {
+            byJob.set(key, {
+              job_id: r.job_id,
+              job_number: r.job_number,
+              status: r.job_status,
+              customer: r.customer,
+              address: [r.address_street, r.address_city].filter(Boolean).join(", ") || null,
+              materials: [],
+            });
+          }
+          byJob.get(key).materials.push({
+            line_id: r.line_id, material_id: r.material_id, material: r.material,
+            emco_sku: r.emco_sku, quantity: r.quantity,
+            unit_cost: r.unit_cost, total_cost: r.total_cost,
+          });
+        }
+
+        return json({
+          location_id: Number(locationId) || locationId,
+          tech_id: loc.assigned_tech_id,
+          since,
+          jobs: [...byJob.values()],
+        });
+      }
+
       // --- 5. Confirm a van restock --------------------------------------
       // POST /api/restock/:locationId/confirm
-      // Body: { items: [{ material_id, pulled_qty, shop_out }], created_by? }
-      //
-      // Per item, ATOMIC and NON-FATAL:
-      //   pulled_qty > 0 : move stock shop(loc 1) -> van in ONE env.DB.batch —
-      //     van.on_hand += pulled_qty (+ transfer_in movement, + last_restocked)
-      //     warehouse.on_hand -= pulled_qty (+ transfer_out movement, may go <0)
-      //     Both movement legs share one reference_id so the transfer is linkable.
-      //   else shop_out  : NO stock change. Seed a crm_inventory_requests row
-      //     (type 'shop_reorder') for the shortfall (max_qty - on_hand) to feed
-      //     the future EMCO reorder list.
-      //   else           : skipped (neither pulled nor shop_out).
+      // Body: { items: [{ material_id, action, qty }], created_by? }
+      // action is one of four per-line outcomes, ATOMIC and NON-FATAL per item:
+      //   "pull_shop"  : van.on_hand += qty (transfer_in) AND shop(loc 1).on_hand
+      //                  -= qty (transfer_out) in ONE batch — both legs share a
+      //                  reference_id. The standard pull from the counted shelf.
+      //   "pull_other" : van.on_hand += qty (transfer_in) ONLY — shop UNTOUCHED.
+      //                  Parts came from loose extras, not the counted shelf; the
+      //                  lone transfer_in is noted as an other/manual source.
+      //   "shop_out"   : NO stock change, NO refill. Seed a crm_inventory_requests
+      //                  row (type 'shop_reorder') for the shortfall (max_qty -
+      //                  on_hand) to flag it for EMCO.
+      //   "skip"       : remove the line — no van, shop, or reorder change.
       // One item failing is reported as 'failed' and never blocks the others.
       const restockMatch = p.match(/^\/api\/restock\/([^/]+)\/confirm$/);
       if (restockMatch && request.method === "POST") {
@@ -680,12 +751,15 @@ export default {
         for (let i = 0; i < items.length; i++) {
           const it = items[i] || {};
           const mid = it.material_id;
-          const pulled = Number(it.pulled_qty) || 0;
+          const action = it.action || "skip";   // pull_shop | pull_other | shop_out | skip
+          const qty = Number(it.qty) || 0;
+          const ref = refBase + i;               // links the leg(s) of THIS line
           try {
             if (mid == null) throw new Error("material_id required");
 
-            if (pulled > 0) {
-              // Need the van row AND the warehouse row to move stock between them.
+            if (action === "pull_shop") {
+              // Standard pull: shop(loc 1) -> van, both legs in ONE atomic batch.
+              if (qty <= 0) throw new Error("qty required for a pull");
               const vanRow = await env.DB.prepare(
                 `SELECT id, on_hand FROM crm_inventory_stock
                   WHERE location_id = ? AND material_id = ?`
@@ -697,38 +771,57 @@ export default {
               if (!vanRow) throw new Error("no van stock row");
               if (!whRow) throw new Error("no warehouse stock row");
 
-              const vanAfter = (vanRow.on_hand ?? 0) + pulled;
-              const whAfter = (whRow.on_hand ?? 0) - pulled; // may go negative
-              const ref = refBase + i; // shared by both legs of THIS pull
-
-              // One atomic batch: both stock rows + both ledger legs move
-              // together, or none do.
               await env.DB.batch([
                 env.DB.prepare(
                   `UPDATE crm_inventory_stock
-                      SET on_hand = ?, last_restocked = datetime('now'),
-                          modified_at = datetime('now')
+                      SET on_hand = ?, last_restocked = datetime('now'), modified_at = datetime('now')
                     WHERE id = ?`
-                ).bind(vanAfter, vanRow.id),
+                ).bind((vanRow.on_hand ?? 0) + qty, vanRow.id),
                 env.DB.prepare(
                   `INSERT INTO crm_inventory_movements
                      (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
                    VALUES (?,?,?,?,?,?,?)`
-                ).bind(mid, locationId, pulled, "transfer_in", ref, "restock pull (shop->van)", operator),
+                ).bind(mid, locationId, qty, "transfer_in", ref, "restock pull (shop->van)", operator),
                 env.DB.prepare(
                   `UPDATE crm_inventory_stock
                       SET on_hand = ?, modified_at = datetime('now')
                     WHERE id = ?`
-                ).bind(whAfter, whRow.id),
+                ).bind((whRow.on_hand ?? 0) - qty, whRow.id),   // shop may go negative
                 env.DB.prepare(
                   `INSERT INTO crm_inventory_movements
                      (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
                    VALUES (?,?,?,?,?,?,?)`
-                ).bind(mid, WAREHOUSE_ID, -pulled, "transfer_out", ref, "restock pull (shop->van)", operator),
+                ).bind(mid, WAREHOUSE_ID, -qty, "transfer_out", ref, "restock pull (shop->van)", operator),
               ]);
-              results.push({ material_id: mid, result: "restocked" });
-            } else if (it.shop_out) {
-              // No stock change — seed a reorder request for the shortfall.
+              results.push({ material_id: mid, result: "pulled_shop", quantity: qty });
+
+            } else if (action === "pull_other") {
+              // Van += qty only. Shop UNTOUCHED — parts came from loose extras,
+              // not the counted shelf. A lone transfer_in noted as other source.
+              if (qty <= 0) throw new Error("qty required for a pull");
+              const vanRow = await env.DB.prepare(
+                `SELECT id, on_hand FROM crm_inventory_stock
+                  WHERE location_id = ? AND material_id = ?`
+              ).bind(locationId, mid).first();
+              if (!vanRow) throw new Error("no van stock row");
+
+              await env.DB.batch([
+                env.DB.prepare(
+                  `UPDATE crm_inventory_stock
+                      SET on_hand = ?, last_restocked = datetime('now'), modified_at = datetime('now')
+                    WHERE id = ?`
+                ).bind((vanRow.on_hand ?? 0) + qty, vanRow.id),
+                env.DB.prepare(
+                  `INSERT INTO crm_inventory_movements
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
+                   VALUES (?,?,?,?,?,?,?)`
+                ).bind(mid, locationId, qty, "transfer_in", ref, "restock pull (other source — not from shop)", operator),
+              ]);
+              results.push({ material_id: mid, result: "pulled_other", quantity: qty });
+
+            } else if (action === "shop_out") {
+              // No stock change, NO refill. Seed a shop_reorder request for the
+              // shortfall (max_qty - on_hand) to flag it for EMCO.
               const vanRow = await env.DB.prepare(
                 `SELECT on_hand, max_qty FROM crm_inventory_stock
                   WHERE location_id = ? AND material_id = ?`
@@ -736,22 +829,19 @@ export default {
               if (!vanRow) throw new Error("no van stock row");
               const shortfall = (vanRow.max_qty ?? 0) - (vanRow.on_hand ?? 0);
               if (shortfall <= 0) {
-                // Already at/above par — nothing to reorder, don't seed a request.
                 results.push({ material_id: mid, result: "skipped", reason: "at_or_above_par" });
               } else {
                 await env.DB.prepare(
                   `INSERT INTO crm_inventory_requests
-                     (material_id, quantity, truck_location_id, requested_by,
-                      status, type, notes)
+                     (material_id, quantity, truck_location_id, requested_by, status, type, notes)
                    VALUES (?,?,?,?,?,?,?)`
-                ).bind(
-                  mid, shortfall, locationId, operator,
-                  "pending", "shop_reorder", "shop out during restock"
-                ).run();
+                ).bind(mid, shortfall, locationId, operator, "pending", "shop_reorder", "shop out during restock").run();
                 results.push({ material_id: mid, result: "shop_reorder", quantity: shortfall });
               }
+
             } else {
-              results.push({ material_id: mid, result: "skipped", reason: "not_requested" });
+              // skip / delete — line removed from this restock. No change anywhere.
+              results.push({ material_id: mid, result: "skipped" });
             }
           } catch (e) {
             results.push({ material_id: mid, result: "failed", error: String(e.message || e) });

@@ -903,6 +903,57 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
         return json({ ok: true, purchase: updated });
       }
 
+      // --- 4g. Office-wide receipts list ---------------------------------
+      // GET /api/purchases?tech_id=&supplier=&from=YYYY-MM-DD&to=YYYY-MM-DD
+      // All purchases newest-first with tech name + customer/job + matched
+      // lines. Powers the office "Receipts" screen. Edit/delete reuse the
+      // job-scoped PATCH/DELETE /api/jobs/:jobId/purchases/:id.
+      if (p === "/api/purchases" && request.method === "GET") {
+        const where = [], binds = [];
+        const techId = url.searchParams.get("tech_id");
+        const supplier = url.searchParams.get("supplier");
+        const from = url.searchParams.get("from");   // YYYY-MM-DD (inclusive)
+        const to = url.searchParams.get("to");       // YYYY-MM-DD (inclusive)
+        if (techId) { where.push("p.tech_id = ?"); binds.push(techId); }
+        if (supplier) { where.push("p.supplier LIKE ?"); binds.push(`%${supplier}%`); }
+        if (from) { where.push("p.created_at >= ?"); binds.push(from); }
+        if (to) { where.push("p.created_at < datetime(?, '+1 day')"); binds.push(to); }
+        const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+        const purchases = (await env.DB.prepare(
+          `SELECT p.id, p.job_id, p.job_number, p.supplier, p.subtotal, p.tax,
+                  p.receipt_total, p.description, p.tech_id, p.truck_location_id,
+                  p.created_at, t.name AS tech_name, j.status AS job_status,
+                  c.name AS customer, c.address_street, c.address_city
+             FROM crm_job_purchases p
+             LEFT JOIN crm_techs t        ON t.st_tech_id = p.tech_id
+             LEFT JOIN crm_st_jobs j      ON j.id = p.job_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+             ${whereSql}
+            ORDER BY p.id DESC
+            LIMIT 500`
+        ).bind(...binds).all()).results || [];
+
+        // Matched lines for these purchases, keyed by the GP-exclusion tag.
+        // Chunk the IN list by 100 (D1 bind-variable safety).
+        const ids = purchases.map((x) => x.id);
+        const byPurchase = {};
+        for (let i = 0; i < ids.length; i += 100) {
+          const notes = ids.slice(i, i + 100).map((id) => receiptTag(id));
+          const ph = notes.map(() => "?").join(",");
+          const rows = (await env.DB.prepare(
+            `SELECT jm.id AS line_id, jm.material_id, m.name AS material, m.emco_sku,
+                    jm.quantity, jm.unit_cost, jm.total_cost, jm.notes
+               FROM crm_job_materials jm LEFT JOIN crm_materials m ON m.id = jm.material_id
+              WHERE jm.notes IN (${ph})`
+          ).bind(...notes).all()).results || [];
+          for (const ln of rows) {
+            const mm = /receipt purchase #(\d+)/.exec(ln.notes || "");
+            if (mm) (byPurchase[mm[1]] ??= []).push(ln);
+          }
+        }
+        return json({ purchases: purchases.map((pp) => ({ ...pp, lines: byPurchase[pp.id] || [] })) });
+      }
+
       // --- 5a. Replenishment list for a van ------------------------------
       // GET /api/restock/:locationId/list
       // The validated replenishment query: materials on this van below reorder

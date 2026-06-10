@@ -32,6 +32,15 @@ const cors = () => ({
 // crm_st_appointments.start_date is stored UTC ISO ("2026-06-09T15:00:00Z");
 // a tech's "today" is the Pacific day, so we return [midnight, next-midnight)
 // Pacific expressed in UTC for a simple range filter on start_date.
+// Provenance tag GP depends on: matched receipt-purchase lines carry this exact
+// string in crm_job_materials.notes so GP EXCLUDES them from material-cost sums
+// (option A — the receipt's tax-included receipt_total is the cost of record).
+// Single-sourced here: POST sets it, GET/DELETE match it. Do NOT change the
+// format — GP filters with: notes IS NULL OR notes NOT LIKE 'receipt purchase #%'.
+const RECEIPT_TAG_PREFIX = "receipt purchase #";
+const receiptTag = (purchaseId) => RECEIPT_TAG_PREFIX + purchaseId;
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
 function pacificDayBoundsUTC(now = new Date()) {
   const dayStr = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Vancouver" }).format(now);
   const wall = new Intl.DateTimeFormat("en-US", {
@@ -630,17 +639,24 @@ export default {
         if (!b.image_base64) return json({ error: "missing_image" }, 400);
         const mediaType = b.media_type || "image/jpeg";
 
-        const prompt = `Extract all line items from this receipt or packing slip. Return JSON ONLY, no markdown fences, no prose. Schema:
-{
-  "supplier": "detected supplier name or empty string",
-  "items": [
-    {"description": "item name", "quantity": 1, "unit_cost": 0.00, "total": 0.00}
-  ],
-  "subtotal": 0.00,
-  "tax": 0.00,
-  "total": 0.00
-}
-If something isn't visible, use 0 for numbers and "" for strings. Do not hallucinate values.`;
+        const prompt = `You are reading a plumbing wholesaler receipt or packing slip (EMCO, Sheret, Wolseley, or similar). The image may be rotated. Return JSON ONLY — no markdown fences, no prose.
+
+MONEY FORMAT — IMPORTANT: some slips (e.g. Wolseley) print money as whole numbers with NO decimal point, where the last two digits are cents: "13106" = 131.06, "2694" = 26.94, "585" = 5.85, "819" = 8.19. If a money value has no decimal point, divide by 100. If it already has a decimal point, read it exactly as printed.
+
+Extract:
+- "supplier": the wholesaler/company name (e.g. "EMCO", "Sheret", "Wolseley"), or "" if unclear.
+- "items": EVERY line item, each with:
+   · "description": the item name as printed (omit leading column codes/line numbers).
+   · "quantity": the shipped/ordered quantity (a number).
+   · "unit_price": the per-unit price column.
+   · "line_total": the printed EXTENDED amount for that row — the column headed "EXTENSION", "Line amt", "Amount", or similar. This is the row's authoritative total (it already accounts for per-100/per-foot pricing). If the slip has no extended column, use 0.
+- "tax_shown": true if the slip prints a GST / PST / HST tax line OR a clearly tax-included grand total; false if it's a packing slip with no tax (no GST/PST lines; total blank or 0.00).
+- "shown_subtotal": the printed pre-tax subtotal, else 0.
+- "shown_tax": GST + PST (+ HST) added together, else 0.
+- "shown_total": the printed grand TOTAL line. IGNORE a 0.00 or blank total (a packing slip with no total) — use 0 then.
+
+Use 0 for any number not visible. Do not hallucinate.
+Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"line_total":0}],"tax_shown":false,"shown_subtotal":0,"shown_tax":0,"shown_total":0}`;
 
         let aiResp;
         try {
@@ -684,9 +700,21 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
         }
         if (!parsed) return json({ error: "parse_failed", raw: text.slice(0, 500) }, 502);
 
-        // Fuzzy-match each line to a catalog material (name/code/emco_sku/search_terms).
+        // Compute each line total = qty × unit_price (NEVER read the line total
+        // off the slip — that was the EMCO bug, grabbing unit price as the total).
+        // Then fuzzy-match each line to a catalog material.
         const items = Array.isArray(parsed.items) ? parsed.items : [];
         for (const it of items) {
+          const qty = Number(it.quantity) || 1;
+          const unit = Number(it.unit_price != null ? it.unit_price : it.unit_cost) || 0;
+          const ext = Number(it.line_total) || 0;
+          it.quantity = qty;
+          it.unit_cost = round2(unit);        // UI reads unit_cost
+          // Prefer the slip's printed EXTENSION (authoritative — handles EMCO's
+          // per-100-ft pipe pricing); fall back to qty × unit when none printed.
+          it.total = ext > 0 ? round2(ext) : round2(qty * unit);
+          delete it.unit_price;
+          delete it.line_total;
           const desc = String(it.description || "").trim();
           if (!desc) { it.match = null; continue; }
           const like = `%${desc.slice(0, 30)}%`;
@@ -699,14 +727,35 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
           it.match = m ? { id: m.id, name: m.name, code: m.code, emco_sku: m.emco_sku, cost: m.cost } : null;
         }
 
+        // Subtotal / tax / total by wholesaler type:
+        //  · tax ALREADY on the slip (e.g. Wolseley GST/PST or tax-included total)
+        //    -> trust the printed grand total; do NOT add another 12%.
+        //  · NO tax shown (EMCO/Sheret packing slips, 0.00 totals) -> sum the
+        //    line totals and apply 12% (PST+GST).
+        const lineSum = round2(items.reduce((a, it) => a + (it.total || 0), 0));
+        const taxShown = parsed.tax_shown === true;
+        const shownTotal = Number(parsed.shown_total) || 0;   // 0.00 → ignored
+        const shownTax = Number(parsed.shown_tax) || 0;
+        const shownSub = Number(parsed.shown_subtotal) || 0;
+        let subtotal, tax, total;
+        if (taxShown && shownTotal > 0) {
+          total = round2(shownTotal);
+          subtotal = shownSub > 0 ? round2(shownSub)
+            : (shownTax > 0 ? round2(total - shownTax) : round2(total / 1.12));
+          tax = shownTax > 0 ? round2(shownTax) : round2(total - subtotal);
+        } else {
+          subtotal = lineSum;
+          tax = round2(subtotal * 0.12);
+          total = round2(subtotal * 1.12);
+        }
+
         return json({
           ok: true,
           job_id: scanMatch[1],
           supplier: parsed.supplier || "",
           items,                                  // each: {description, quantity, unit_cost, total, match}
-          subtotal: Number(parsed.subtotal || 0),
-          tax: Number(parsed.tax || 0),
-          total: Number(parsed.total || 0),
+          subtotal, tax, total,
+          tax_shown: taxShown,                    // true = tax already on the slip (not re-taxed)
         });
       }
 
@@ -729,6 +778,8 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
         if (!supplier) return json({ error: "supplier required" }, 400);
         if (!Number.isFinite(total)) return json({ error: "total must be a number" }, 400);
         if (b.tech_id == null) return json({ error: "tech_id required" }, 400);
+        const subtotal = Number.isFinite(Number(b.subtotal)) ? Number(b.subtotal) : null;
+        const tax = Number.isFinite(Number(b.tax)) ? Number(b.tax) : null;
 
         const items = Array.isArray(b.items) ? b.items : [];
         const description = (b.description && String(b.description).trim()) ||
@@ -737,13 +788,15 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
         // 1) Receipt header -> crm_job_purchases.
         const ins = await env.DB.prepare(
           `INSERT INTO crm_job_purchases
-             (job_id, job_number, supplier, receipt_total, description, receipt_photo_url, tech_id, truck_location_id)
-           VALUES (?,?,?,?,?,?,?,?)`
+             (job_id, job_number, supplier, receipt_total, subtotal, tax, description, receipt_photo_url, tech_id, truck_location_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?)`
         ).bind(
           jobId,
           b.job_number ?? String(jobId),
           supplier,
-          total,
+          total,             // receipt_total = tax-included total = the cost of record (option A)
+          subtotal,
+          tax,
           description,
           b.receipt_photo_url ?? null,
           b.tech_id,
@@ -770,7 +823,7 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
                   tech_id, truck_location_id, notes, is_prepull)
                VALUES (?,?,?,?,?,?,?,?,?,?)`
             ).bind(jobId, b.job_number ?? String(jobId), it.material_id, qty, unitCost, lineTotal,
-              b.tech_id, null, `receipt purchase #${purchaseId}`, 0).run();
+              b.tech_id, null, receiptTag(purchaseId), 0).run();   // GP-exclusion tag
             loggedLines.push({ material_id: it.material_id, line_id: mIns.meta?.last_row_id ?? null,
               quantity: qty, unit_cost: unitCost, total_cost: lineTotal });
           } catch (e) {
@@ -782,10 +835,72 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
           ok: true,
           job_id: jobId,
           purchase_id: purchaseId,
-          supplier, receipt_total: total,
-          logged_to_materials: loggedLines,   // matched lines also recorded as job materials
+          supplier, subtotal, tax, receipt_total: total,
+          logged_to_materials: loggedLines,   // matched lines also recorded as job materials (tagged for GP exclusion)
           deducted_van_stock: false,          // explicit: receipts never draw down the van
         });
+      }
+
+      // --- 4e. View a job's receipt purchases (+ the lines each created) --
+      // GET /api/jobs/:jobId/purchases -> { purchases:[{ id, supplier, subtotal,
+      // tax, receipt_total, description, created_at, lines:[matched materials] }]}.
+      if (purchMatch && request.method === "GET") {
+        const jobId = purchMatch[1];
+        const purchases = (await env.DB.prepare(
+          `SELECT id, supplier, subtotal, tax, receipt_total, description, created_at
+             FROM crm_job_purchases WHERE job_id = ? ORDER BY id DESC`
+        ).bind(jobId).all()).results || [];
+        const mlines = (await env.DB.prepare(
+          `SELECT jm.id AS line_id, jm.material_id, m.name AS material, m.emco_sku,
+                  jm.quantity, jm.unit_cost, jm.total_cost, jm.notes
+             FROM crm_job_materials jm LEFT JOIN crm_materials m ON m.id = jm.material_id
+            WHERE jm.job_id = ? AND jm.notes LIKE ?`
+        ).bind(jobId, RECEIPT_TAG_PREFIX + "%").all()).results || [];
+        const byPurchase = {};
+        for (const ln of mlines) {
+          const mm = /receipt purchase #(\d+)/.exec(ln.notes || "");
+          if (mm) (byPurchase[mm[1]] ??= []).push(ln);
+        }
+        return json({ purchases: purchases.map((pp) => ({ ...pp, lines: byPurchase[pp.id] || [] })) });
+      }
+
+      // --- 4f. Delete / edit one receipt purchase (job-scoped) -----------
+      // DELETE /api/jobs/:jobId/purchases/:id -> remove the receipt + the matched
+      //   lines it created (the GP-tagged crm_job_materials rows). NO van reversal
+      //   — purchases never wrote a job_usage movement, so nothing was deducted.
+      // PATCH  /api/jobs/:jobId/purchases/:id  body { supplier?, subtotal?, tax?,
+      //   total? } -> edit the receipt header only.
+      const purchOne = p.match(/^\/api\/jobs\/([^/]+)\/purchases\/(\d+)$/);
+      if (purchOne && (request.method === "DELETE" || request.method === "PATCH")) {
+        const jobId = purchOne[1];
+        const purchaseId = purchOne[2];
+        const row = await env.DB.prepare(
+          `SELECT id, job_id FROM crm_job_purchases WHERE id = ?`
+        ).bind(purchaseId).first();
+        if (!row || String(row.job_id) !== String(jobId)) return json({ error: "not found" }, 404);
+
+        if (request.method === "DELETE") {
+          await env.DB.batch([
+            env.DB.prepare(`DELETE FROM crm_job_materials WHERE job_id = ? AND notes = ?`)
+              .bind(jobId, receiptTag(purchaseId)),
+            env.DB.prepare(`DELETE FROM crm_job_purchases WHERE id = ?`).bind(purchaseId),
+          ]);
+          return json({ ok: true, deleted_purchase: Number(purchaseId), deducted_van_stock: false });
+        }
+
+        // PATCH — header only (matched lines are edited as ordinary materials).
+        const b = await request.json().catch(() => ({}));
+        const sets = [], binds = [];
+        if (b.supplier != null && String(b.supplier).trim()) { sets.push("supplier = ?"); binds.push(String(b.supplier).trim()); }
+        if (b.subtotal != null && Number.isFinite(Number(b.subtotal))) { sets.push("subtotal = ?"); binds.push(Number(b.subtotal)); }
+        if (b.tax != null && Number.isFinite(Number(b.tax))) { sets.push("tax = ?"); binds.push(Number(b.tax)); }
+        if (b.total != null && Number.isFinite(Number(b.total))) { sets.push("receipt_total = ?"); binds.push(Number(b.total)); }
+        if (!sets.length) return json({ error: "nothing to update" }, 400);
+        await env.DB.prepare(`UPDATE crm_job_purchases SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, purchaseId).run();
+        const updated = await env.DB.prepare(
+          `SELECT id, supplier, subtotal, tax, receipt_total FROM crm_job_purchases WHERE id = ?`
+        ).bind(purchaseId).first();
+        return json({ ok: true, purchase: updated });
       }
 
       // --- 5a. Replenishment list for a van ------------------------------
@@ -861,6 +976,7 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
               customer: r.customer,
               address: [r.address_street, r.address_city].filter(Boolean).join(", ") || null,
               materials: [],
+              purchases: [],
             });
           }
           byJob.get(key).materials.push({
@@ -868,6 +984,24 @@ If something isn't visible, use 0 for numbers and "" for strings. Do not halluci
             emco_sku: r.emco_sku, quantity: r.quantity,
             unit_cost: r.unit_cost, total_cost: r.total_cost,
           });
+        }
+
+        // Attach each job's RECEIPT PURCHASES (by this van's tech) for context +
+        // office delete/edit. Purchases don't deduct van stock; their matched
+        // lines never show in `materials` above (no job_usage movement).
+        const jobIds = [...byJob.keys()].filter((k) => /^\d+$/.test(String(k)));
+        if (jobIds.length) {
+          const ph = jobIds.map(() => "?").join(",");
+          const purchases = (await env.DB.prepare(
+            `SELECT id, job_id, supplier, subtotal, tax, receipt_total, created_at
+               FROM crm_job_purchases
+              WHERE tech_id = ? AND job_id IN (${ph})
+              ORDER BY id DESC`
+          ).bind(loc.assigned_tech_id, ...jobIds).all()).results || [];
+          for (const pu of purchases) {
+            const job = byJob.get(pu.job_id);
+            if (job) job.purchases.push(pu);
+          }
         }
 
         return json({

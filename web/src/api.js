@@ -63,3 +63,60 @@ export async function deleteMaterial(jobId, lineId) {
   if (!r.ok) throw new Error("delete " + r.status);
   return r.json();
 }
+
+// READ-ONLY vision scan of a receipt image. imageBase64 is the RAW base64 (no
+// "data:" prefix). Returns { ok, supplier, items:[{description, quantity,
+// unit_cost, total, match}], subtotal, tax, total }. Writes nothing — the tech
+// confirms via savePurchase.
+export async function scanReceipt(jobId, imageBase64, mediaType) {
+  const r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}/scan-receipt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image_base64: imageBase64, media_type: mediaType }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.message || d.error || ("scan " + r.status));
+  return d;
+}
+
+// Commit the confirmed receipt: writes ONE crm_job_purchases row + (for each
+// matched line the tech flagged) a crm_job_materials line. NO van deduction.
+// body: { tech_id, supplier, total, description?, items:[{description, quantity,
+//   unit_cost, total, material_id?, log_to_materials?}] }
+export async function savePurchase(jobId, body) {
+  const r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}/purchases`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("purchase " + r.status));
+  return d;
+}
+
+// GET a job's saved receipts -> { purchases:[{ id, supplier, subtotal, tax,
+// receipt_total, created_at, lines:[matched materials] }] }.
+export async function getJobPurchases(jobId) {
+  const r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}/purchases`);
+  if (!r.ok) throw new Error("purchases " + r.status);
+  return r.json();
+}
+
+// DELETE a receipt — removes the purchase + the matched lines it created (no van
+// reversal; nothing was deducted).
+export async function deletePurchase(jobId, id) {
+  const r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}/purchases/${encodeURIComponent(id)}`, { method: "DELETE" });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("delete " + r.status));
+  return d;
+}
+
+// PATCH a receipt header — { supplier?, subtotal?, tax?, total? }.
+export async function patchPurchase(jobId, id, body) {
+  const r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}/purchases/${encodeURIComponent(id)}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("edit " + r.status));
+  return d;
+}

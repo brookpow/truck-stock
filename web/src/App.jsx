@@ -1,8 +1,15 @@
 import { useState, useEffect, useRef } from "react";
-import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty } from "./api";
+import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
+  scanReceipt, savePurchase, getJobPurchases, deletePurchase, patchPurchase } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 
 const fmt = (n) => "$" + (Number(n) || 0).toFixed(2);
+const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100; // round to cents
+const TAX_RATE = 0.12; // PST + GST
+// Matched receipt lines carry this in notes; they show under "Receipts", NOT in
+// "On this job" (and are excluded from its total) — option A / GP-consistent.
+const RECEIPT_NOTE_PREFIX = "receipt purchase #";
+const isReceiptLine = (it) => (it.notes || "").startsWith(RECEIPT_NOTE_PREFIX);
 const STORE_KEY = "ts_tech"; // remembers the logged-in tech on this device
 
 export default function App() {
@@ -216,15 +223,20 @@ function Capture({ tech, job, onBack }) {
   const [pending, setPending] = useState(pendingCount());       // global count (banner)
   const [pendingItems, setPendingItems] = useState([]);         // this job's queued saves
   const [note, setNote] = useState("");                          // transient status note
+  const [showReceipt, setShowReceipt] = useState(false);         // receipt-scan sub-screen
+  const [purchases, setPurchases] = useState([]);                // saved receipts on this job
   const timer = useRef(null);
   const noteTimer = useRef(null);
 
-  // Load already-logged materials for this job (server-confirmed lines).
+  // Load this job's logged materials (van-used only — receipt-matched lines are
+  // excluded here and shown under Receipts) + the saved receipts.
   function refresh() {
     getJobMaterials(job.id).then((r) => {
-      setItems(r.items || []);
-      setTotal(r.total_material_cost || 0);
+      const vanItems = (r.items || []).filter((it) => !isReceiptLine(it));
+      setItems(vanItems);
+      setTotal(vanItems.reduce((a, x) => a + (x.total_cost || 0), 0));
     }).catch(() => {});
+    getJobPurchases(job.id).then((r) => setPurchases(r.purchases || [])).catch(() => {});
   }
 
   // Recompute the offline view: the banner count + this job's queued items.
@@ -362,6 +374,19 @@ function Capture({ tech, job, onBack }) {
     0
   );
 
+  // Receipt scanner takes over the screen while active; on save, refresh the
+  // job's logged lines (matched receipt items may have been logged) and flash.
+  if (showReceipt) {
+    return (
+      <ReceiptScan
+        tech={tech}
+        job={job}
+        onCancel={() => setShowReceipt(false)}
+        onDone={(r) => { setShowReceipt(false); refresh(); flashNote(`Receipt saved${r?.logged_to_materials?.length ? ` · ${r.logged_to_materials.length} logged to job` : ""}`); }}
+      />
+    );
+  }
+
   return (
     <div style={styles.screen}>
       <div style={styles.topbar}>
@@ -389,6 +414,10 @@ function Capture({ tech, job, onBack }) {
         onChange={(e) => setQ(e.target.value)}
         autoFocus
       />
+
+      <button style={styles.scanBtn} onClick={() => setShowReceipt(true)}>
+        📷 Scan a receipt (supplier purchase — not off the van)
+      </button>
 
       {results.map((m) => (
         <div key={m.id} style={styles.resultRow}>
@@ -469,6 +498,257 @@ function Capture({ tech, job, onBack }) {
           </button>
         </div>
       ))}
+
+      {purchases.length > 0 && (
+        <div style={styles.receiptsSection}>
+          <div style={styles.receiptsLabel}>Receipts (supplier purchases)</div>
+          {purchases.map((pu) => (
+            <ReceiptRow key={pu.id} jobId={job.id} purchase={pu} onChanged={refresh} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// One saved receipt on the capture screen: collapsed summary; expand to its
+// matched lines; edit the header (supplier/subtotal/total with tax recompute);
+// delete (removes the receipt + its matched lines, no van reversal).
+function ReceiptRow({ jobId, purchase, onChanged }) {
+  const [open, setOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [supplier, setSupplier] = useState(purchase.supplier || "");
+  const [subtotal, setSubtotal] = useState(purchase.subtotal != null ? String(purchase.subtotal) : "");
+  const [total, setTotal] = useState(purchase.receipt_total != null ? String(purchase.receipt_total) : "");
+  const tax = r2((Number(total) || 0) - (Number(subtotal) || 0));
+  function onSubtotal(v) { setSubtotal(v); setTotal(String(r2((Number(v) || 0) * (1 + TAX_RATE)))); }
+  const lines = purchase.lines || [];
+
+  async function del() {
+    if (!confirm(`Delete this receipt (${purchase.supplier} · ${fmt(purchase.receipt_total)})?\nRemoves it and any matched lines it logged. No van stock changes.`)) return;
+    setBusy(true);
+    try { await deletePurchase(jobId, purchase.id); onChanged(); }
+    catch (e) { alert("Delete failed: " + (e.message || e)); setBusy(false); }
+  }
+  async function saveEdit() {
+    setBusy(true);
+    try {
+      await patchPurchase(jobId, purchase.id, { supplier: supplier.trim(), subtotal: Number(subtotal) || 0, tax, total: Number(total) || 0 });
+      setEditing(false); onChanged();
+    } catch (e) { alert("Edit failed: " + (e.message || e)); setBusy(false); }
+  }
+
+  return (
+    <div style={styles.receiptCard}>
+      <div style={styles.receiptHead}>
+        <button style={styles.receiptToggle} onClick={() => setOpen((o) => !o)}>
+          <span style={styles.ellip}>{purchase.supplier || "Receipt"}</span>
+          <span style={styles.muted}>
+            {fmt(purchase.receipt_total)} · {lines.length} item{lines.length === 1 ? "" : "s"} {open ? "▾" : "▸"}
+          </span>
+        </button>
+        <button style={styles.editBtnSm} disabled={busy} onClick={() => setEditing((e) => !e)}>edit</button>
+        <button style={styles.delBtnSm} disabled={busy} onClick={del} aria-label="delete receipt">{busy ? "…" : "×"}</button>
+      </div>
+
+      {open && !editing && (
+        <div style={styles.receiptBody}>
+          <div style={styles.muted}>Subtotal {fmt(purchase.subtotal)} · Tax {fmt(purchase.tax)} · Total {fmt(purchase.receipt_total)}</div>
+          {lines.map((ln) => (
+            <div key={ln.line_id} style={styles.muted}>· {ln.material || ("#" + ln.material_id)} ×{ln.quantity} ({fmt(ln.total_cost)})</div>
+          ))}
+          {lines.length === 0 && <div style={styles.muted}>· no matched catalog lines</div>}
+        </div>
+      )}
+
+      {editing && (
+        <div style={styles.receiptBody}>
+          <div style={styles.muted}>Supplier</div>
+          <input style={styles.input} value={supplier} onChange={(e) => setSupplier(e.target.value)} />
+          <div style={styles.taxRow}><span style={styles.muted}>Subtotal</span><input style={styles.taxInput} inputMode="decimal" value={subtotal} onChange={(e) => onSubtotal(e.target.value)} /></div>
+          <div style={styles.taxRow}><span style={styles.muted}>Tax (12%)</span><span style={styles.taxVal}>{fmt(tax)}</span></div>
+          <div style={styles.taxRow}><span style={{ fontWeight: 700 }}>Total</span><input style={{ ...styles.taxInput, fontWeight: 700 }} inputMode="decimal" value={total} onChange={(e) => setTotal(e.target.value)} /></div>
+          <button style={styles.primary} disabled={busy} onClick={saveEdit}>{busy ? "Saving…" : "Save changes"}</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Downscale a captured photo (phone cameras are huge) and return RAW base64 —
+// keeps the upload small/fast; the receipt text stays legible at ~1600px.
+function fileToScaledBase64(file, maxDim = 1600, quality = 0.85) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("couldn't read the photo"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("couldn't decode the photo"));
+      img.onload = () => {
+        const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+        const c = document.createElement("canvas");
+        c.width = w; c.height = h;
+        c.getContext("2d").drawImage(img, 0, 0, w, h);
+        const dataUrl = c.toDataURL("image/jpeg", quality);
+        resolve({ base64: dataUrl.split(",")[1], mediaType: "image/jpeg" });
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+// ---- Receipt scanner: capture -> vision -> review/confirm -> purchases ------
+// Photograph a receipt, the worker's vision endpoint extracts supplier + line
+// items + catalog matches (writes nothing), the tech confirms/edits which lines
+// to log, then we POST to /purchases (writes the receipt; NO van deduction).
+function ReceiptScan({ tech, job, onDone, onCancel }) {
+  const [phase, setPhase] = useState("capture"); // capture | scanning | review | saving
+  const [err, setErr] = useState(null);
+  const [supplier, setSupplier] = useState("");
+  const [subtotal, setSubtotal] = useState("");
+  const [total, setTotal] = useState("");
+  const [lines, setLines] = useState([]);
+
+  // Tax line is always derived = total − subtotal (shows 12% by default; if the
+  // tech edits the total, tax follows so the three stay consistent).
+  const tax = r2((Number(total) || 0) - (Number(subtotal) || 0));
+  // Editing subtotal re-derives the total at the standard 12%.
+  function onSubtotal(v) { setSubtotal(v); setTotal(String(r2((Number(v) || 0) * (1 + TAX_RATE)))); }
+
+  async function onFile(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = ""; // let them re-pick the same file
+    if (!file) return;
+    setErr(null); setPhase("scanning");
+    try {
+      const { base64, mediaType } = await fileToScaledBase64(file);
+      const r = await scanReceipt(job.id, base64, mediaType);
+      setSupplier(r.supplier || "");
+      // The worker already computed subtotal/total per the wholesaler rules
+      // (tax-included slips kept as-is; packing slips taxed at 12%). Use them
+      // directly — re-deriving would re-tax an already-tax-included total.
+      setSubtotal(r.subtotal ? String(r.subtotal) : "");
+      setTotal(r.total ? String(r.total) : "");
+      setLines((r.items || []).map((it) => ({
+        description: it.description || "",
+        quantity: String(it.quantity ?? 1),
+        unit_cost: String(it.unit_cost ?? 0),
+        match: it.match || null,
+        log: !!it.match, // default: log the matched lines
+      })));
+      setPhase("review");
+    } catch (e2) {
+      setErr(String(e2.message || e2));
+      setPhase("capture");
+    }
+  }
+
+  function setLine(i, patch) { setLines((ls) => ls.map((l, j) => (j === i ? { ...l, ...patch } : l))); }
+  function removeLine(i) { setLines((ls) => ls.filter((_, j) => j !== i)); }
+
+  async function save() {
+    const t = Number(total);
+    if (!supplier.trim()) { alert("Enter the supplier."); return; }
+    if (!(t > 0)) { alert("Enter the receipt total."); return; }
+    setPhase("saving");
+    try {
+      const res = await savePurchase(job.id, {
+        tech_id: tech.st_tech_id,
+        supplier: supplier.trim(),
+        subtotal: Number(subtotal) || 0,
+        tax,
+        total: t,
+        description: lines.map((l) => l.description).filter(Boolean).slice(0, 4).join(", "),
+        items: lines.map((l) => ({
+          description: l.description,
+          quantity: Number(l.quantity) || 1,
+          unit_cost: Number(l.unit_cost) || 0,
+          total: (Number(l.unit_cost) || 0) * (Number(l.quantity) || 1),
+          material_id: l.match ? l.match.id : null,
+          log_to_materials: l.match ? !!l.log : false,
+        })),
+      });
+      onDone(res);
+    } catch (e) {
+      alert("Couldn't save: " + (e.message || e));
+      setPhase("review");
+    }
+  }
+
+  return (
+    <div style={styles.screen}>
+      <div style={styles.topbar}>
+        <button style={styles.linkBtn} onClick={onCancel}>← cancel</button>
+        <span style={styles.who}>Receipt · {job.cust || job.num}</span>
+      </div>
+      <h1 style={styles.h1}>Scan a receipt</h1>
+
+      {err && <div style={styles.error}>{err}</div>}
+
+      {phase === "capture" && (
+        <>
+          <p style={styles.sub}>Photograph the receipt or packing slip — <b>fill the frame, get close on the line items and total</b> so the text is sharp. You'll confirm everything before saving.</p>
+          <label style={{ ...styles.primary, display: "block", boxSizing: "border-box", textAlign: "center", lineHeight: "48px" }}>
+            📷 Photograph the receipt
+            <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onFile} />
+          </label>
+        </>
+      )}
+
+      {phase === "scanning" && <div style={styles.muted}>Reading the receipt…</div>}
+
+      {(phase === "review" || phase === "saving") && (
+        <>
+          <div style={{ marginBottom: 8 }}>
+            <div style={styles.muted}>Supplier</div>
+            <input style={styles.input} value={supplier} onChange={(e) => setSupplier(e.target.value)} />
+          </div>
+          <p style={styles.sub}>Confirm each line. <b>Matched</b> items can be logged to the job (tick "log"); un-matched lines stay on the receipt only. Remove anything wrong with ×.</p>
+
+          {lines.map((ln, i) => (
+            <div key={i} style={styles.rcptLine}>
+              <input style={styles.rcptDesc} value={ln.description} onChange={(e) => setLine(i, { description: e.target.value })} />
+              <div style={styles.rcptRow2}>
+                <span style={styles.muted}>qty</span>
+                <input type="text" inputMode="numeric" style={styles.rcptNum} value={ln.quantity} onChange={(e) => setLine(i, { quantity: e.target.value })} />
+                <span style={styles.muted}>$</span>
+                <input type="text" inputMode="decimal" style={styles.rcptNum} value={ln.unit_cost} onChange={(e) => setLine(i, { unit_cost: e.target.value })} />
+                {ln.match ? (
+                  <label style={styles.rcptMatch}>
+                    <input type="checkbox" checked={ln.log} onChange={(e) => setLine(i, { log: e.target.checked })} /> log: {ln.match.name}
+                  </label>
+                ) : (
+                  <span style={styles.rcptFree}>not in catalog</span>
+                )}
+                <button style={styles.rcptDel} onClick={() => removeLine(i)} aria-label="remove line">×</button>
+              </div>
+            </div>
+          ))}
+
+          <div style={styles.taxBox}>
+            <div style={styles.taxRow}>
+              <span style={styles.muted}>Subtotal</span>
+              <input type="text" inputMode="decimal" style={styles.taxInput} value={subtotal} onChange={(e) => onSubtotal(e.target.value)} />
+            </div>
+            <div style={styles.taxRow}>
+              <span style={styles.muted}>Tax (12% PST+GST)</span>
+              <span style={styles.taxVal}>{fmt(tax)}</span>
+            </div>
+            <div style={{ ...styles.taxRow, borderTop: "1px solid #ddd", paddingTop: 8, marginTop: 4 }}>
+              <span style={{ fontWeight: 700 }}>Total</span>
+              <input type="text" inputMode="decimal" style={{ ...styles.taxInput, fontWeight: 700 }} value={total} onChange={(e) => setTotal(e.target.value)} />
+            </div>
+          </div>
+
+          <button style={styles.primary} disabled={phase === "saving"} onClick={save}>
+            {phase === "saving" ? "Saving…" : "Save purchase"}
+          </button>
+          <button style={styles.scanBtn} onClick={() => setPhase("capture")}>↺ retake photo</button>
+        </>
+      )}
     </div>
   );
 }
@@ -496,9 +776,29 @@ const styles = {
   manualToggle: { background: "none", border: "none", color: "#185fa5", fontSize: 14, padding: "10px 0", marginTop: 6, cursor: "pointer", textAlign: "left", display: "block" },
   input: { width: "100%", height: 48, fontSize: 16, padding: "0 12px", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, marginBottom: 10 },
   primary: { width: "100%", height: 48, fontSize: 16, fontWeight: 500, background: "#185fa5", color: "#fff", border: "none", borderRadius: 10, cursor: "pointer" },
+  scanBtn: { display: "block", width: "100%", boxSizing: "border-box", height: 46, fontSize: 15, fontWeight: 500, background: "#fff", color: "#185fa5", border: "1px solid #185fa5", borderRadius: 10, cursor: "pointer", marginBottom: 12, textAlign: "center" },
+  rcptLine: { border: "1px solid #e2e2e2", borderRadius: 10, padding: "8px 10px", marginBottom: 8, background: "#fff" },
+  rcptDesc: { width: "100%", height: 38, fontSize: 15, padding: "0 8px", boxSizing: "border-box", border: "1px solid #ddd", borderRadius: 8, marginBottom: 6 },
+  rcptRow2: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },
+  rcptNum: { width: 58, height: 34, fontSize: 14, textAlign: "right", padding: "0 6px", boxSizing: "border-box", border: "1px solid #ddd", borderRadius: 6 },
+  rcptMatch: { fontSize: 13, color: "#1d7a4d", display: "flex", alignItems: "center", gap: 4, flex: 1, minWidth: 60 },
+  rcptFree: { fontSize: 13, color: "#999", fontStyle: "italic", flex: 1 },
+  rcptDel: { width: 32, height: 32, flex: "none", marginLeft: "auto", fontSize: 18, lineHeight: "32px", border: "none", borderRadius: 6, background: "#c0392b", color: "#fff", cursor: "pointer", padding: 0 },
   resultRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fff" },
   addBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#1d9e75", color: "#fff", cursor: "pointer" },
   delBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#c0392b", color: "#fff", cursor: "pointer" },
+  taxBox: { border: "1px solid #ddd", borderRadius: 10, padding: "10px 12px", margin: "10px 0" },
+  taxRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0" },
+  taxInput: { width: 96, height: 36, fontSize: 15, textAlign: "right", padding: "0 8px", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 8 },
+  taxVal: { fontSize: 15 },
+  receiptsSection: { marginTop: 16 },
+  receiptsLabel: { fontSize: 13, fontWeight: 600, color: "#8a5a00", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 },
+  receiptCard: { border: "1px solid #e8e0cf", borderRadius: 10, background: "#fffdf6", marginBottom: 8 },
+  receiptHead: { display: "flex", alignItems: "center", padding: "8px 10px", gap: 6 },
+  receiptToggle: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, background: "none", border: "none", textAlign: "left", cursor: "pointer", padding: 0 },
+  receiptBody: { padding: "0 12px 10px", display: "flex", flexDirection: "column", gap: 4 },
+  editBtnSm: { flex: "none", height: 32, fontSize: 13, padding: "0 10px", border: "1px solid #185fa5", borderRadius: 6, background: "#fff", color: "#185fa5", cursor: "pointer" },
+  delBtnSm: { width: 32, height: 32, flex: "none", fontSize: 18, lineHeight: "32px", border: "none", borderRadius: 6, background: "#c0392b", color: "#fff", cursor: "pointer", padding: 0 },
   qtyInput: { width: 52, height: 44, flex: "none", marginLeft: 8, fontSize: 16, textAlign: "center", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, padding: "0 4px" },
   totalBar: { display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: "1px solid #ddd", paddingTop: 12, marginTop: 12, marginBottom: 8 },
   inclPending: { color: "#8a5a00", fontStyle: "italic" },

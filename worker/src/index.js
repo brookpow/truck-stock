@@ -727,33 +727,43 @@ Extract:
 Use 0 for any number not visible. Do not hallucinate.
 Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"line_total":0}],"tax_shown":false,"shown_subtotal":0,"shown_tax":0,"shown_total":0}`;
 
+        const callVision = () => fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-api-key": env.ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+          },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 1500,
+            messages: [{
+              role: "user",
+              content: [
+                { type: "image", source: { type: "base64", media_type: mediaType, data: b.image_base64 } },
+                { type: "text", text: prompt },
+              ],
+            }],
+          }),
+        });
         let aiResp;
         try {
-          aiResp = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-api-key": env.ANTHROPIC_API_KEY,
-              "anthropic-version": "2023-06-01",
-            },
-            body: JSON.stringify({
-              model: "claude-sonnet-4-20250514",
-              max_tokens: 1500,
-              messages: [{
-                role: "user",
-                content: [
-                  { type: "image", source: { type: "base64", media_type: mediaType, data: b.image_base64 } },
-                  { type: "text", text: prompt },
-                ],
-              }],
-            }),
-          });
+          aiResp = await callVision();
+          // 529 = Overloaded (transient Anthropic capacity). One quick retry
+          // before surfacing it — many overloads clear within a second or two.
+          if (aiResp.status === 529) {
+            await new Promise((r) => setTimeout(r, 1500));
+            aiResp = await callVision();
+          }
         } catch (e) {
           return json({ error: "anthropic_network", message: String(e?.message || e) }, 502);
         }
         if (!aiResp.ok) {
           const errText = await aiResp.text().catch(() => "");
-          return json({ error: "anthropic_http", status: aiResp.status, message: errText.slice(0, 500) }, 502);
+          // retryable flag lets the client distinguish "busy, try again" (529/5xx)
+          // from a hard failure. The tech UI shows a friendly message either way.
+          const retryable = aiResp.status === 529 || aiResp.status >= 500;
+          return json({ error: "vision_unavailable", status: aiResp.status, retryable, message: errText.slice(0, 300) }, 502);
         }
         const data = await aiResp.json().catch(() => null);
         const text = data?.content?.[0]?.text || "";
@@ -873,6 +883,19 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
         ).run();
         const purchaseId = ins.meta?.last_row_id ?? null;
 
+        // 1b) Store the receipt photo in R2 (PRIVATE; served via
+        // /api/purchases/:id/photo). Reuses the base64 the tech already captured
+        // for the scan — no second photo. Non-fatal: a storage hiccup must never
+        // lose the receipt itself.
+        if (purchaseId && b.image_base64 && env.RECEIPTS) {
+          try {
+            const key = `receipts/${purchaseId}.jpg`;
+            const bytes = Uint8Array.from(atob(b.image_base64), (c) => c.charCodeAt(0));
+            await env.RECEIPTS.put(key, bytes, { httpMetadata: { contentType: b.media_type || "image/jpeg" } });
+            await env.DB.prepare(`UPDATE crm_job_purchases SET receipt_photo_url = ? WHERE id = ?`).bind(key, purchaseId).run();
+          } catch (_) { /* photo is optional — keep the receipt */ }
+        }
+
         // 2) Optionally log matched lines to crm_job_materials — NO deduction.
         const loggedLines = [];
         for (const it of items) {
@@ -916,7 +939,8 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
       if (purchMatch && request.method === "GET") {
         const jobId = purchMatch[1];
         const purchases = (await env.DB.prepare(
-          `SELECT id, supplier, subtotal, tax, receipt_total, description, created_at
+          `SELECT id, supplier, subtotal, tax, receipt_total, description, created_at,
+                  (receipt_photo_url IS NOT NULL) AS has_photo
              FROM crm_job_purchases WHERE job_id = ? ORDER BY id DESC`
         ).bind(jobId).all()).results || [];
         const mlines = (await env.DB.prepare(
@@ -954,7 +978,14 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
               .bind(jobId, receiptTag(purchaseId)),
             env.DB.prepare(`DELETE FROM crm_job_purchases WHERE id = ?`).bind(purchaseId),
           ]);
-          return json({ ok: true, deleted_purchase: Number(purchaseId), deducted_van_stock: false });
+          // Drop the receipt photo from R2 too (non-fatal). Report the outcome
+          // so a storage failure is visible, not silently swallowed.
+          let photo_removed = false, photo_error = null;
+          if (env.RECEIPTS) {
+            try { await env.RECEIPTS.delete(`receipts/${purchaseId}.jpg`); photo_removed = true; }
+            catch (e) { photo_error = String(e?.message || e); }
+          }
+          return json({ ok: true, deleted_purchase: Number(purchaseId), photo_removed, photo_error, deducted_van_stock: false });
         }
 
         // PATCH — header only (matched lines are edited as ordinary materials).
@@ -991,7 +1022,8 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
         const purchases = (await env.DB.prepare(
           `SELECT p.id, p.job_id, p.job_number, p.supplier, p.subtotal, p.tax,
                   p.receipt_total, p.description, p.tech_id, p.truck_location_id,
-                  p.created_at, t.name AS tech_name, j.status AS job_status,
+                  p.created_at, (p.receipt_photo_url IS NOT NULL) AS has_photo,
+                  t.name AS tech_name, j.status AS job_status,
                   c.name AS customer, c.address_street, c.address_city
              FROM crm_job_purchases p
              LEFT JOIN crm_techs t        ON t.st_tech_id = p.tech_id
@@ -1021,6 +1053,26 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
           }
         }
         return json({ purchases: purchases.map((pp) => ({ ...pp, lines: byPurchase[pp.id] || [] })) });
+      }
+
+      // --- 4h. Serve a receipt photo from R2 (PRIVATE; through the worker) --
+      // GET /api/purchases/:id/photo -> the stored JPEG, or 404 if none.
+      const photoMatch = p.match(/^\/api\/purchases\/(\d+)\/photo$/);
+      if (photoMatch && request.method === "GET") {
+        const row = await env.DB.prepare(
+          `SELECT receipt_photo_url FROM crm_job_purchases WHERE id = ?`
+        ).bind(photoMatch[1]).first();
+        if (!row || !row.receipt_photo_url) return json({ error: "no_photo" }, 404);
+        if (!env.RECEIPTS) return json({ error: "storage_unbound" }, 503);
+        const obj = await env.RECEIPTS.get(row.receipt_photo_url);
+        if (!obj) return json({ error: "not_in_storage" }, 404);
+        return new Response(obj.body, {
+          headers: {
+            "content-type": obj.httpMetadata?.contentType || "image/jpeg",
+            "cache-control": "private, max-age=86400",
+            "access-control-allow-origin": "*",
+          },
+        });
       }
 
       // --- 5a. Replenishment list for a van ------------------------------
@@ -1113,7 +1165,8 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
         if (jobIds.length) {
           const ph = jobIds.map(() => "?").join(",");
           const purchases = (await env.DB.prepare(
-            `SELECT id, job_id, supplier, subtotal, tax, receipt_total, created_at
+            `SELECT id, job_id, supplier, subtotal, tax, receipt_total, created_at,
+                    (receipt_photo_url IS NOT NULL) AS has_photo
                FROM crm_job_purchases
               WHERE tech_id = ? AND job_id IN (${ph})
               ORDER BY id DESC`

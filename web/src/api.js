@@ -138,3 +138,8 @@ export async function createRequest(body) {
   if (!r.ok) throw new Error(d.error || ("request " + r.status));
   return d;
 }
+
+// Worker route that serves a receipt's photo from R2 (private). Use as <img src>.
+export function receiptPhotoUrl(id) {
+  return `${API}/api/purchases/${encodeURIComponent(id)}/photo`;
+}

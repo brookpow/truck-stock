@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
   scanReceipt, savePurchase, getJobPurchases, deletePurchase, patchPurchase,
-  getByCategory, createRequest } from "./api";
+  getByCategory, createRequest, receiptPhotoUrl } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 
 const fmt = (n) => "$" + (Number(n) || 0).toFixed(2);
@@ -629,6 +629,11 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
             <div key={ln.line_id} style={styles.muted}>· {ln.material || ("#" + ln.material_id)} ×{ln.quantity} ({fmt(ln.total_cost)})</div>
           ))}
           {lines.length === 0 && <div style={styles.muted}>· no matched catalog lines</div>}
+          {purchase.has_photo ? (
+            <a href={receiptPhotoUrl(purchase.id)} target="_blank" rel="noreferrer">
+              <img src={receiptPhotoUrl(purchase.id)} alt="receipt" style={styles.thumb} />
+            </a>
+          ) : null}
         </div>
       )}
 
@@ -681,6 +686,8 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
   const [subtotal, setSubtotal] = useState("");
   const [total, setTotal] = useState("");
   const [lines, setLines] = useState([]);
+  const [imgB64, setImgB64] = useState(null);            // the downscaled JPEG, reused for R2
+  const [imgMedia, setImgMedia] = useState("image/jpeg");
 
   // Tax line is always derived = total − subtotal (shows 12% by default; if the
   // tech edits the total, tax follows so the three stay consistent).
@@ -695,6 +702,7 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
     setErr(null); setPhase("scanning");
     try {
       const { base64, mediaType } = await fileToScaledBase64(file);
+      setImgB64(base64); setImgMedia(mediaType);   // keep it to store on save (no second photo)
       const r = await scanReceipt(job.id, base64, mediaType);
       setSupplier(r.supplier || "");
       // The worker already computed subtotal/total per the wholesaler rules
@@ -711,13 +719,23 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
       })));
       setPhase("review");
     } catch (e2) {
-      setErr(String(e2.message || e2));
-      setPhase("capture");
+      // NEVER surface raw vision/error JSON to the tech — show a friendly,
+      // actionable failure screen (retry or manual entry) instead.
+      console.warn("scan failed:", e2);
+      setPhase("failed");
     }
   }
 
   function setLine(i, patch) { setLines((ls) => ls.map((l, j) => (j === i ? { ...l, ...patch } : l))); }
   function removeLine(i) { setLines((ls) => ls.filter((_, j) => j !== i)); }
+
+  // Fall back to manual entry when the scan can't run (vision busy/unreadable).
+  // Keep imgB64 — the PHOTO captured fine; only parsing failed, so the receipt
+  // image is still stored on save.
+  function startManual() {
+    setSupplier(""); setSubtotal(""); setTotal(""); setLines([]);
+    setPhase("review");
+  }
 
   async function save() {
     const t = Number(total);
@@ -731,6 +749,8 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
         subtotal: Number(subtotal) || 0,
         tax,
         total: t,
+        image_base64: imgB64 || undefined,   // store the receipt photo in R2 (reuses the scan image)
+        media_type: imgMedia,
         description: lines.map((l) => l.description).filter(Boolean).slice(0, 4).join(", "),
         items: lines.map((l) => ({
           description: l.description,
@@ -770,13 +790,24 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
 
       {phase === "scanning" && <div style={styles.muted}>Reading the receipt…</div>}
 
+      {phase === "failed" && (
+        <div style={styles.failBox}>
+          <div style={styles.failTitle}>Couldn't scan the receipt</div>
+          <p style={styles.sub}>Scanning's busy right now (or it couldn't read the photo). Try again in a moment, or enter the receipt details by hand — the photo you took is still saved either way.</p>
+          <button style={styles.primary} onClick={() => setPhase("capture")}>↻ Try again</button>
+          <button style={styles.scanBtn} onClick={startManual}>Enter details manually</button>
+        </div>
+      )}
+
       {(phase === "review" || phase === "saving") && (
         <>
           <div style={{ marginBottom: 8 }}>
             <div style={styles.muted}>Supplier</div>
             <input style={styles.input} value={supplier} onChange={(e) => setSupplier(e.target.value)} />
           </div>
-          <p style={styles.sub}>Confirm each line. <b>Matched</b> items can be logged to the job (tick "log"); un-matched lines stay on the receipt only. Remove anything wrong with ×.</p>
+          <p style={styles.sub}>{lines.length > 0
+            ? <>Confirm each line. <b>Matched</b> items can be logged to the job (tick "log"); un-matched lines stay on the receipt only. Remove anything wrong with ×.</>
+            : <>Enter the supplier and total below. (No line items — that's fine; the receipt's saved as a supplier purchase.)</>}</p>
 
           {lines.map((ln, i) => (
             <div key={i} style={styles.rcptLine}>
@@ -829,6 +860,8 @@ const styles = {
   sub: { fontSize: 14, color: "#555", margin: "0 0 12px" },
   muted: { fontSize: 13, color: "#777" },
   error: { fontSize: 14, color: "#a32d2d", padding: 8, background: "#fcebeb", borderRadius: 8, margin: "8px 0" },
+  failBox: { textAlign: "center", padding: "18px 8px" },
+  failTitle: { fontSize: 18, fontWeight: 600, color: "#a32d2d", marginBottom: 8 },
   topbar: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 },
   who: { fontSize: 14, fontWeight: 500 },
   linkBtn: { background: "none", border: "none", color: "#185fa5", fontSize: 14, padding: 4, cursor: "pointer" },
@@ -877,6 +910,7 @@ const styles = {
   receiptHead: { display: "flex", alignItems: "center", padding: "8px 10px", gap: 6 },
   receiptToggle: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, background: "none", border: "none", textAlign: "left", cursor: "pointer", padding: 0 },
   receiptBody: { padding: "0 12px 10px", display: "flex", flexDirection: "column", gap: 4 },
+  thumb: { marginTop: 6, width: 120, height: 120, objectFit: "cover", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" },
   editBtnSm: { flex: "none", height: 32, fontSize: 13, padding: "0 10px", border: "1px solid #185fa5", borderRadius: 6, background: "#fff", color: "#185fa5", cursor: "pointer" },
   delBtnSm: { width: 32, height: 32, flex: "none", fontSize: 18, lineHeight: "32px", border: "none", borderRadius: 6, background: "#c0392b", color: "#fff", cursor: "pointer", padding: 0 },
   qtyInput: { width: 52, height: 44, flex: "none", marginLeft: 8, fontSize: 16, textAlign: "center", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, padding: "0 4px" },

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
-  scanReceipt, savePurchase, getJobPurchases, deletePurchase, patchPurchase } from "./api";
+  scanReceipt, savePurchase, getJobPurchases, deletePurchase, patchPurchase,
+  getByCategory, createRequest } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 
 const fmt = (n) => "$" + (Number(n) || 0).toFixed(2);
@@ -225,6 +226,13 @@ function Capture({ tech, job, onBack }) {
   const [note, setNote] = useState("");                          // transient status note
   const [showReceipt, setShowReceipt] = useState(false);         // receipt-scan sub-screen
   const [purchases, setPurchases] = useState([]);                // saved receipts on this job
+  const [categories, setCategories] = useState([]);              // catalog grouped, for browse
+  const [openCat, setOpenCat] = useState(null);                  // one category open at a time
+  const [showReq, setShowReq] = useState(false);                 // special-request form open
+  const [reqDesc, setReqDesc] = useState("");
+  const [reqQty, setReqQty] = useState("");
+  const [reqNotes, setReqNotes] = useState("");
+  const [reqBusy, setReqBusy] = useState(false);
   const timer = useRef(null);
   const noteTimer = useRef(null);
 
@@ -328,6 +336,28 @@ function Capture({ tech, job, onBack }) {
     }
   }
 
+  // Load the catalog grouped by category for the browse (once on mount).
+  useEffect(() => { getByCategory().then((d) => setCategories(d.categories || [])).catch(() => {}); }, []);
+
+  // Send a free-text "can't find it" request to the office.
+  async function submitRequest() {
+    if (!reqDesc.trim()) { alert("Describe the item you need."); return; }
+    setReqBusy(true);
+    try {
+      await createRequest({
+        tech_id: tech.st_tech_id, job_id: job.id, description: reqDesc.trim(),
+        quantity: Number(reqQty) > 0 ? Number(reqQty) : 1,
+        notes: reqNotes.trim() || undefined,
+      });
+      setReqDesc(""); setReqQty(""); setReqNotes(""); setShowReq(false);
+      flashNote("Request sent to the office");
+    } catch (e) {
+      alert("Couldn't send request: " + (e.message || e));
+    } finally {
+      setReqBusy(false);
+    }
+  }
+
   // Commit a quantity edit from a logged row's numeric input. Online-only:
   // calls PATCH then refreshes. Ignores no-ops; resets the field on bad/failed
   // input so it never shows a value the server didn't accept.
@@ -428,6 +458,46 @@ function Capture({ tech, job, onBack }) {
           <button style={styles.addBtn} disabled={saving} onClick={() => add(m)} aria-label={"add " + m.name}>+</button>
         </div>
       ))}
+
+      {categories.length > 0 && (
+        <div style={styles.browseSection}>
+          <div style={styles.browseLabel}>Browse by category</div>
+          {categories.map((c) => (
+            <div key={c.name} style={styles.catBlock}>
+              <button style={styles.catHeader} onClick={() => setOpenCat(openCat === c.name ? null : c.name)}>
+                <span>{c.name}</span>
+                <span style={styles.muted}>{c.count} {openCat === c.name ? "▾" : "▸"}</span>
+              </button>
+              {openCat === c.name && c.items.map((m) => (
+                <div key={m.id} style={styles.catItemRow}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div style={styles.ellip}>{m.name}</div>
+                    <div style={styles.muted}>{fmt(m.cost)}</div>
+                  </div>
+                  <button style={styles.addBtn} disabled={saving} onClick={() => add(m)} aria-label={"add " + m.name}>+</button>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={styles.reqSection}>
+        {!showReq ? (
+          <button style={styles.reqEntry} onClick={() => setShowReq(true)}>🙋 Request an item / can't find it?</button>
+        ) : (
+          <div style={styles.reqForm}>
+            <input style={styles.input} placeholder="What do you need? e.g. 1/2 brass nipple" value={reqDesc} onChange={(e) => setReqDesc(e.target.value)} autoFocus />
+            <div style={styles.reqRow}>
+              <span style={styles.muted}>qty</span>
+              <input type="text" inputMode="numeric" style={styles.reqQtyInput} value={reqQty} onChange={(e) => setReqQty(e.target.value)} placeholder="1" />
+            </div>
+            <input style={styles.input} placeholder="notes (optional)" value={reqNotes} onChange={(e) => setReqNotes(e.target.value)} />
+            <button style={styles.primary} disabled={reqBusy} onClick={submitRequest}>{reqBusy ? "Sending…" : "Send request to office"}</button>
+            <button style={styles.scanBtn} onClick={() => { setShowReq(false); setReqDesc(""); setReqQty(""); setReqNotes(""); }}>cancel</button>
+          </div>
+        )}
+      </div>
 
       <div style={styles.totalBar}>
         <span style={styles.muted}>
@@ -786,6 +856,16 @@ const styles = {
   rcptDel: { width: 32, height: 32, flex: "none", marginLeft: "auto", fontSize: 18, lineHeight: "32px", border: "none", borderRadius: 6, background: "#c0392b", color: "#fff", cursor: "pointer", padding: 0 },
   resultRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fff" },
   addBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#1d9e75", color: "#fff", cursor: "pointer" },
+  browseSection: { marginTop: 10 },
+  browseLabel: { fontSize: 13, fontWeight: 600, color: "#555", marginBottom: 8 },
+  catBlock: { marginBottom: 6 },
+  catHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", padding: "12px 14px", border: "1px solid #ddd", borderRadius: 10, background: "#fafafa", cursor: "pointer", fontSize: 15, fontWeight: 500, boxSizing: "border-box" },
+  catItemRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px 8px 18px", marginLeft: 8, borderLeft: "2px solid #eee" },
+  reqSection: { marginTop: 14 },
+  reqEntry: { width: "100%", padding: "12px 14px", border: "1px dashed #bbb", borderRadius: 10, background: "#fff", cursor: "pointer", fontSize: 15, color: "#185fa5", boxSizing: "border-box" },
+  reqForm: { border: "1px solid #ddd", borderRadius: 10, padding: 12 },
+  reqRow: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10 },
+  reqQtyInput: { width: 70, height: 44, fontSize: 16, textAlign: "center", border: "1px solid #ccc", borderRadius: 10, boxSizing: "border-box" },
   delBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#c0392b", color: "#fff", cursor: "pointer" },
   taxBox: { border: "1px solid #ddd", borderRadius: 10, padding: "10px 12px", margin: "10px 0" },
   taxRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0" },

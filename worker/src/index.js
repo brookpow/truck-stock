@@ -285,6 +285,75 @@ export default {
         return json(r.results || []);
       }
 
+      // --- 1b. Catalog grouped by category (tech browse) -----------------
+      // One fetch (~302 active rows) grouped by category for the collapsible
+      // browse below the search bar. Lean fields: just what add()/display need.
+      if (p === "/api/materials/by-category" && request.method === "GET") {
+        const rows = (await env.DB.prepare(
+          `SELECT id, name, cost, category FROM crm_materials WHERE is_active = 1 ORDER BY category, name`
+        ).all()).results || [];
+        const map = new Map();
+        for (const r of rows) {
+          const cat = r.category || "Uncategorized";
+          if (!map.has(cat)) map.set(cat, []);
+          map.get(cat).push({ id: r.id, name: r.name, cost: r.cost });
+        }
+        const categories = [...map.entries()].map(([name, items]) => ({ name, count: items.length, items }));
+        return json({ categories });
+      }
+
+      // --- 1c. Special request: tech can't find an item ------------------
+      // POST /api/requests  body { tech_id, description, quantity?, notes?, job_id? }
+      // Writes crm_inventory_requests: material_id=0 sentinel (column is NOT NULL,
+      // no FK), type='special_request', status='pending'. No cost, no stock
+      // change. truck_location_id resolved from the tech's van.
+      if (p === "/api/requests" && request.method === "POST") {
+        const b = await request.json().catch(() => ({}));
+        const description = (b.description || "").trim();
+        if (b.tech_id == null) return json({ error: "tech_id required" }, 400);
+        if (!description) return json({ error: "description required" }, 400);
+        const qty = Number(b.quantity) > 0 ? Number(b.quantity) : 1;
+        const van = await env.DB.prepare(
+          `SELECT id FROM crm_inventory_locations WHERE type='truck' AND active=1 AND assigned_tech_id = ?`
+        ).bind(b.tech_id).first();
+        const ins = await env.DB.prepare(
+          `INSERT INTO crm_inventory_requests
+             (material_id, type, custom_description, quantity, urgency, notes, requested_by, truck_location_id, job_id, status)
+           VALUES (0, 'special_request', ?, ?, 'normal', ?, ?, ?, ?, 'pending')`
+        ).bind(description, qty, b.notes || null, b.tech_id, van ? van.id : null, b.job_id || null).run();
+        return json({ ok: true, request_id: ins.meta?.last_row_id ?? null, truck_location_id: van ? van.id : null });
+      }
+
+      // --- 1d. Office: list special requests + mark handled --------------
+      // GET /api/requests?type=special_request&status=pending -> { requests, count }.
+      // The type filter is AIRTIGHT: special_request and shop_reorder never mix.
+      if (p === "/api/requests" && request.method === "GET") {
+        const type = url.searchParams.get("type") || "special_request";
+        const status = url.searchParams.get("status") || "pending";
+        const rows = (await env.DB.prepare(
+          `SELECT r.id, r.custom_description, r.quantity, r.notes, r.created_at,
+                  r.requested_by, r.truck_location_id, t.name AS tech_name, l.name AS van_name
+             FROM crm_inventory_requests r
+             LEFT JOIN crm_techs t ON t.st_tech_id = r.requested_by
+             LEFT JOIN crm_inventory_locations l ON l.id = r.truck_location_id
+            WHERE r.type = ? AND r.status = ?
+            ORDER BY r.id DESC`
+        ).bind(type, status).all()).results || [];
+        return json({ requests: rows, count: rows.length });
+      }
+
+      // POST /api/requests/:id/handle -> status='fulfilled' (scoped to special_request).
+      const reqHandle = p.match(/^\/api\/requests\/(\d+)\/handle$/);
+      if (reqHandle && request.method === "POST") {
+        const id = reqHandle[1];
+        const b = await request.json().catch(() => ({}));
+        const r = await env.DB.prepare(
+          `UPDATE crm_inventory_requests SET status='fulfilled', updated_at=datetime('now'), fulfilled_note=?
+            WHERE id=? AND type='special_request'`
+        ).bind(b.note || null, id).run();
+        return json({ ok: true, id: Number(id), handled: (r.meta?.changes ?? 0) > 0 });
+      }
+
       // --- 2. Log a used material to a job --------------------------------
       // Body: { material_id, quantity, tech_id?, truck_location_id?, job_number? }
       // Cost is FROZEN here: we read the catalog cost now and write it onto the

@@ -120,3 +120,21 @@ export async function patchPurchase(jobId, id, body) {
   if (!r.ok) throw new Error(d.error || ("edit " + r.status));
   return d;
 }
+
+// Catalog grouped by category for browse -> { categories:[{ name, count, items:[{id,name,cost}] }] }.
+export async function getByCategory() {
+  const r = await fetch(`${API}/api/materials/by-category`);
+  if (!r.ok) throw new Error("by-category " + r.status);
+  return r.json();
+}
+
+// Special request -> writes crm_inventory_requests (no cost, no stock change).
+// body: { tech_id, description, quantity?, notes?, job_id? }
+export async function createRequest(body) {
+  const r = await fetch(`${API}/api/requests`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("request " + r.status));
+  return d;
+}

@@ -1003,6 +1003,54 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
         return json({ ok: true, purchase: updated });
       }
 
+      // --- 4f2. Off-cycle / overhead purchase (NO job) -------------------
+      // POST /api/overhead/purchases  Body: { tech_id, supplier, total, subtotal?,
+      //   tax?, description?, image_base64?, media_type?, items? }
+      // Writes ONE crm_job_purchases row flagged is_overhead=1 with the job_id=0
+      // sentinel (the column is NOT NULL). NO matched crm_job_materials lines and
+      // NO van deduction — structurally a job receipt minus the job, so it touches
+      // ZERO inventory.
+      if (p === "/api/overhead/purchases" && request.method === "POST") {
+        const b = await request.json().catch(() => ({}));
+        const supplier = (b.supplier || "").trim();
+        const total = Number(b.total);
+        if (!supplier) return json({ error: "supplier required" }, 400);
+        if (!Number.isFinite(total)) return json({ error: "total must be a number" }, 400);
+        if (b.tech_id == null) return json({ error: "tech_id required" }, 400);
+        const subtotal = Number.isFinite(Number(b.subtotal)) ? Number(b.subtotal) : null;
+        const tax = Number.isFinite(Number(b.tax)) ? Number(b.tax) : null;
+        const items = Array.isArray(b.items) ? b.items : [];
+        const description = (b.description && String(b.description).trim()) ||
+          items.map((i) => i.description).filter(Boolean).slice(0, 4).join(", ") || null;
+
+        // ONE row, is_overhead=1, job_id=0 sentinel. No crm_job_materials writes.
+        const ins = await env.DB.prepare(
+          `INSERT INTO crm_job_purchases
+             (job_id, job_number, supplier, receipt_total, subtotal, tax, description, receipt_photo_url, tech_id, truck_location_id, is_overhead)
+           VALUES (0, NULL, ?, ?, ?, ?, ?, NULL, ?, NULL, 1)`
+        ).bind(supplier, total, subtotal, tax, description, b.tech_id).run();
+        const purchaseId = ins.meta?.last_row_id ?? null;
+
+        // Receipt photo -> R2 (same as job receipts). Non-fatal.
+        if (purchaseId && b.image_base64 && env.RECEIPTS) {
+          try {
+            const key = `receipts/${purchaseId}.jpg`;
+            const bytes = Uint8Array.from(atob(b.image_base64), (c) => c.charCodeAt(0));
+            await env.RECEIPTS.put(key, bytes, { httpMetadata: { contentType: b.media_type || "image/jpeg" } });
+            await env.DB.prepare(`UPDATE crm_job_purchases SET receipt_photo_url = ? WHERE id = ?`).bind(key, purchaseId).run();
+          } catch (_) { /* photo optional */ }
+        }
+
+        return json({
+          ok: true,
+          purchase_id: purchaseId,
+          is_overhead: true,
+          supplier, subtotal, tax, receipt_total: total,
+          logged_to_materials: [],     // overhead writes ZERO job-material lines
+          deducted_van_stock: false,   // and NEVER touches van stock
+        });
+      }
+
       // --- 4g. Office-wide receipts list ---------------------------------
       // GET /api/purchases?tech_id=&supplier=&from=YYYY-MM-DD&to=YYYY-MM-DD
       // All purchases newest-first with tech name + customer/job + matched
@@ -1022,7 +1070,7 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
         const purchases = (await env.DB.prepare(
           `SELECT p.id, p.job_id, p.job_number, p.supplier, p.subtotal, p.tax,
                   p.receipt_total, p.description, p.tech_id, p.truck_location_id,
-                  p.created_at, (p.receipt_photo_url IS NOT NULL) AS has_photo,
+                  p.created_at, (p.receipt_photo_url IS NOT NULL) AS has_photo, p.is_overhead,
                   t.name AS tech_name, j.status AS job_status,
                   c.name AS customer, c.address_street, c.address_city
              FROM crm_job_purchases p

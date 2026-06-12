@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
-  scanReceipt, savePurchase, getJobPurchases, deletePurchase, patchPurchase,
+  scanReceipt, savePurchase, saveOverheadPurchase, getJobPurchases, deletePurchase, patchPurchase,
   getByCategory, createRequest, receiptPhotoUrl } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 
@@ -118,6 +118,7 @@ function Jobs({ tech, onSignOut }) {
   const [manual, setManual] = useState(false);
   const [manualId, setManualId] = useState("");
   const [active, setActive] = useState(null); // selected job
+  const [overhead, setOverhead] = useState(false); // off-cycle / overhead purchase (no job)
   const [err, setErr] = useState(false);
 
   useEffect(() => {
@@ -143,6 +144,12 @@ function Jobs({ tech, onSignOut }) {
 
   if (active) {
     return <Capture tech={tech} job={active} onBack={() => setActive(null)} />;
+  }
+  if (overhead) {
+    // No job: a pseudo-job flagged overhead. ReceiptScan routes the save to
+    // /api/overhead/purchases and logs no matched materials.
+    return <ReceiptScan tech={tech} job={{ id: 0, num: "off-cycle", cust: "Off-cycle purchase", overhead: true }}
+      onDone={() => setOverhead(false)} onCancel={() => setOverhead(false)} />;
   }
 
   const jobs = data ? data.jobs : null;
@@ -176,6 +183,12 @@ function Jobs({ tech, onSignOut }) {
         <div style={styles.muted}>No jobs assigned to you for today.</div>
       )}
       {err && <div style={styles.error}>Couldn't load today's jobs — enter the job number below.</div>}
+
+      {/* Off-cycle / overhead purchase — a receipt with no job (consumables, shop
+          supplies). Reuses the scanner; writes an overhead-flagged purchase. */}
+      <button style={styles.overheadBtn} onClick={() => setOverhead(true)}>
+        📋 Off-cycle purchase — not for a job
+      </button>
 
       {/* Manual entry: auto-shown when there are no jobs / fallback="manual",
           and reachable via the toggle for a job that isn't on the list. */}
@@ -743,7 +756,7 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
     if (!(t > 0)) { alert("Enter the receipt total."); return; }
     setPhase("saving");
     try {
-      const res = await savePurchase(job.id, {
+      const body = {
         tech_id: tech.st_tech_id,
         supplier: supplier.trim(),
         subtotal: Number(subtotal) || 0,
@@ -752,7 +765,8 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
         image_base64: imgB64 || undefined,   // store the receipt photo in R2 (reuses the scan image)
         media_type: imgMedia,
         description: lines.map((l) => l.description).filter(Boolean).slice(0, 4).join(", "),
-        items: lines.map((l) => ({
+        // Overhead has NO job, so it logs NO matched materials.
+        items: job.overhead ? [] : lines.map((l) => ({
           description: l.description,
           quantity: Number(l.quantity) || 1,
           unit_cost: Number(l.unit_cost) || 0,
@@ -760,7 +774,8 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
           material_id: l.match ? l.match.id : null,
           log_to_materials: l.match ? !!l.log : false,
         })),
-      });
+      };
+      const res = job.overhead ? await saveOverheadPurchase(body) : await savePurchase(job.id, body);
       onDone(res);
     } catch (e) {
       alert("Couldn't save: " + (e.message || e));
@@ -772,9 +787,10 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
     <div style={styles.screen}>
       <div style={styles.topbar}>
         <button style={styles.linkBtn} onClick={onCancel}>← cancel</button>
-        <span style={styles.who}>Receipt · {job.cust || job.num}</span>
+        <span style={styles.who}>{job.overhead ? "🧰 Off-cycle purchase" : "Receipt · " + (job.cust || job.num)}</span>
       </div>
-      <h1 style={styles.h1}>Scan a receipt</h1>
+      <h1 style={styles.h1}>{job.overhead ? "Off-cycle / overhead purchase" : "Scan a receipt"}</h1>
+      {job.overhead && <div style={styles.overheadNote}>Recorded as <b>overhead / consumables</b> — not tied to a job, and touches no inventory (no van deduction, no job materials).</div>}
 
       {err && <div style={styles.error}>{err}</div>}
 
@@ -877,6 +893,8 @@ const styles = {
   recentSection: { marginTop: 22, paddingTop: 6, borderTop: "1px solid #eee" },
   recentHint: { fontSize: 12, color: "#8a6a00", marginTop: 4 },
   manualToggle: { background: "none", border: "none", color: "#185fa5", fontSize: 14, padding: "10px 0", marginTop: 6, cursor: "pointer", textAlign: "left", display: "block" },
+  overheadBtn: { display: "block", width: "100%", boxSizing: "border-box", padding: "14px 16px", marginTop: 18, fontSize: 15, fontWeight: 500, background: "#fbf7ef", color: "#7a5b16", border: "1px solid #e3d3ad", borderRadius: 10, cursor: "pointer", textAlign: "left" },
+  overheadNote: { fontSize: 13, color: "#7a5b16", background: "#fbf7ef", border: "1px solid #e3d3ad", borderRadius: 8, padding: "8px 10px", margin: "0 0 12px" },
   input: { width: "100%", height: 48, fontSize: 16, padding: "0 12px", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, marginBottom: 10 },
   primary: { width: "100%", height: 48, fontSize: 16, fontWeight: 500, background: "#185fa5", color: "#fff", border: "none", borderRadius: 10, cursor: "pointer" },
   scanBtn: { display: "block", width: "100%", boxSizing: "border-box", height: 46, fontSize: 15, fontWeight: 500, background: "#fff", color: "#185fa5", border: "1px solid #185fa5", borderRadius: 10, cursor: "pointer", marginBottom: 12, textAlign: "center" },

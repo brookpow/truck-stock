@@ -94,6 +94,17 @@ export async function savePurchase(jobId, body) {
   return d;
 }
 
+// Off-cycle / overhead purchase (NO job). Writes is_overhead=1 / job_id=0; no
+// matched lines, no van deduction — structurally a receipt minus the job.
+export async function saveOverheadPurchase(body) {
+  const r = await fetch(`${API}/api/overhead/purchases`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("overhead " + r.status));
+  return d;
+}
+
 // GET a job's saved receipts -> { purchases:[{ id, supplier, subtotal, tax,
 // receipt_total, created_at, lines:[matched materials] }] }.
 export async function getJobPurchases(jobId) {

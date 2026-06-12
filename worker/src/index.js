@@ -16,6 +16,8 @@
 //   If your real schema differs, Claude Code should run PRAGMA table_info on both
 //   and adjust the column names below. Marked with  // VERIFY  comments.
 
+import { authenticate, signJWT, verifyPassword } from "./auth.js";
+
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
     status,
@@ -25,7 +27,7 @@ const json = (data, status = 200) =>
 const cors = () => ({
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
 });
 
 // Pacific (America/Vancouver) calendar day as UTC bounds, DST-correct.
@@ -199,6 +201,30 @@ export default {
     const p = url.pathname;
 
     try {
+      // --- Auth (self-contained TS auth; TS_JWT_SECRET, isolated from the CRM) ---
+      // POST /api/auth/login { account, password } -> { token } signed with
+      // TS_JWT_SECRET, verified against ts_auth (PBKDF2). Issuer for BOTH the
+      // office and gp shared logins.
+      if (p === "/api/auth/login" && request.method === "POST") {
+        const b = await request.json().catch(() => ({}));
+        const account = String(b.account || "").trim().toLowerCase();
+        const password = String(b.password || "");
+        if (!account || !password) return json({ error: "account and password required" }, 400);
+        if (!env.TS_JWT_SECRET) return json({ error: "auth_not_configured" }, 503);
+        const row = await env.DB.prepare(`SELECT password_hash FROM ts_auth WHERE account = ?`).bind(account).first();
+        if (!row || !(await verifyPassword(password, row.password_hash))) {
+          return json({ error: "invalid_credentials" }, 401);
+        }
+        return json({ ok: true, account, token: await signJWT({ account, typ: "ts" }, env.TS_JWT_SECRET) });
+      }
+
+      // GET /api/whoami -> the token's account (S2/S3 verify point; no enforcement).
+      if (p === "/api/whoami" && request.method === "GET") {
+        const payload = await authenticate(request, env);
+        if (!payload) return json({ error: "unauthenticated" }, 401);
+        return json({ ok: true, account: payload.account, typ: payload.typ });
+      }
+
       // --- 0a. Tech roster for the name picker ----------------------------
       // Verified against the real crm_techs schema (PRAGMA table_info):
       //   id, name, email, is_active, st_tech_id, ...

@@ -41,6 +41,59 @@ const RECEIPT_TAG_PREFIX = "receipt purchase #";
 const receiptTag = (purchaseId) => RECEIPT_TAG_PREFIX + purchaseId;
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
+// Shared shop(loc 1) -> van transfer. ONE atomic batch: van on_hand += qty +
+// transfer_in, shop on_hand -= qty + transfer_out. PURE inventory — no purchase,
+// no crm_job_materials line. Used by BOTH the office restock confirm (pull_shop)
+// and the tech from-shop restock. Returns a per-item result row. opts:
+//   autoCreateVan   — create the van stock row at on_hand 0 if missing (tech adds
+//                     a material not yet on the van). Office leaves it required.
+//   reportShortfall — include shop_shortfall when shop < qty (shop goes negative).
+//   note            — movement note (defaults to the office wording).
+async function pullShopToVan(env, vanId, mid, qty, operator, ref, opts = {}) {
+  const WAREHOUSE_ID = 1; // Shop Warehouse (loc 1)
+  if (mid == null) throw new Error("material_id required");
+  if (!(qty > 0)) throw new Error("qty required for a pull");
+  const note = opts.note || "restock pull (shop->van)";
+
+  const whRow = await env.DB.prepare(
+    `SELECT id, on_hand FROM crm_inventory_stock WHERE location_id = ? AND material_id = ?`
+  ).bind(WAREHOUSE_ID, mid).first();
+  if (!whRow) {
+    // Can't pull what the shop doesn't track. Office throws (caught -> failed);
+    // tech flags it so the tech sees why nothing moved.
+    if (opts.autoCreateVan) return { material_id: mid, result: "shop_untracked", quantity: qty };
+    throw new Error("no warehouse stock row");
+  }
+
+  let vanRow = await env.DB.prepare(
+    `SELECT id, on_hand FROM crm_inventory_stock WHERE location_id = ? AND material_id = ?`
+  ).bind(vanId, mid).first();
+  if (!vanRow) {
+    if (!opts.autoCreateVan) throw new Error("no van stock row");
+    // Tech grabbed a material not yet on their van — add the row at 0 (no par).
+    const ins = await env.DB.prepare(
+      `INSERT INTO crm_inventory_stock (location_id, material_id, on_hand, min_qty, max_qty) VALUES (?,?,0,0,0)`
+    ).bind(vanId, mid).run();
+    vanRow = { id: ins.meta?.last_row_id, on_hand: 0 };
+  }
+
+  const shopBefore = whRow.on_hand ?? 0;
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE crm_inventory_stock SET on_hand = ?, last_restocked = datetime('now'), modified_at = datetime('now') WHERE id = ?`)
+      .bind((vanRow.on_hand ?? 0) + qty, vanRow.id),
+    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by) VALUES (?,?,?,?,?,?,?)`)
+      .bind(mid, vanId, qty, "transfer_in", ref, note, operator),
+    env.DB.prepare(`UPDATE crm_inventory_stock SET on_hand = ?, modified_at = datetime('now') WHERE id = ?`)
+      .bind(shopBefore - qty, whRow.id),   // shop may go negative — recount/reorder signal
+    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by) VALUES (?,?,?,?,?,?,?)`)
+      .bind(mid, WAREHOUSE_ID, -qty, "transfer_out", ref, note, operator),
+  ]);
+
+  const out = { material_id: mid, result: "pulled_shop", quantity: qty };
+  if (opts.reportShortfall && shopBefore < qty) out.shop_shortfall = qty - shopBefore;
+  return out;
+}
+
 function pacificDayBoundsUTC(now = new Date()) {
   const dayStr = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Vancouver" }).format(now);
   const wall = new Intl.DateTimeFormat("en-US", {
@@ -1288,42 +1341,10 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
             if (mid == null) throw new Error("material_id required");
 
             if (action === "pull_shop") {
-              // Standard pull: shop(loc 1) -> van, both legs in ONE atomic batch.
-              if (qty <= 0) throw new Error("qty required for a pull");
-              const vanRow = await env.DB.prepare(
-                `SELECT id, on_hand FROM crm_inventory_stock
-                  WHERE location_id = ? AND material_id = ?`
-              ).bind(locationId, mid).first();
-              const whRow = await env.DB.prepare(
-                `SELECT id, on_hand FROM crm_inventory_stock
-                  WHERE location_id = ? AND material_id = ?`
-              ).bind(WAREHOUSE_ID, mid).first();
-              if (!vanRow) throw new Error("no van stock row");
-              if (!whRow) throw new Error("no warehouse stock row");
-
-              await env.DB.batch([
-                env.DB.prepare(
-                  `UPDATE crm_inventory_stock
-                      SET on_hand = ?, last_restocked = datetime('now'), modified_at = datetime('now')
-                    WHERE id = ?`
-                ).bind((vanRow.on_hand ?? 0) + qty, vanRow.id),
-                env.DB.prepare(
-                  `INSERT INTO crm_inventory_movements
-                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
-                   VALUES (?,?,?,?,?,?,?)`
-                ).bind(mid, locationId, qty, "transfer_in", ref, "restock pull (shop->van)", operator),
-                env.DB.prepare(
-                  `UPDATE crm_inventory_stock
-                      SET on_hand = ?, modified_at = datetime('now')
-                    WHERE id = ?`
-                ).bind((whRow.on_hand ?? 0) - qty, whRow.id),   // shop may go negative
-                env.DB.prepare(
-                  `INSERT INTO crm_inventory_movements
-                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
-                   VALUES (?,?,?,?,?,?,?)`
-                ).bind(mid, WAREHOUSE_ID, -qty, "transfer_out", ref, "restock pull (shop->van)", operator),
-              ]);
-              results.push({ material_id: mid, result: "pulled_shop", quantity: qty });
+              // Shared transfer engine (factored). Office keeps its behavior:
+              // van/shop row required — a throw becomes a "failed" result below,
+              // no auto-create, no shortfall field.
+              results.push(await pullShopToVan(env, locationId, mid, qty, operator, ref));
 
             } else if (action === "pull_other") {
               // Van += qty only. Shop UNTOUCHED — parts came from loose extras,
@@ -1396,6 +1417,41 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
         );
 
         return json({ location_id: Number(locationId) || locationId, results, on_hand });
+      }
+
+      // --- 5c. Tech-initiated restock FROM SHOP (no job, no purchase) -----
+      // POST /api/restock/from-shop  { st_tech_id, items:[{material_id, quantity}] }
+      // Resolves the tech's van and runs each item through the SAME pullShopToVan
+      // transfer (shop loc 1 -> van). PURE inventory: transfer_out + transfer_in,
+      // NO purchase, NO crm_job_materials line. Insufficient shop -> pull + flag
+      // shop_shortfall (shop may go negative). Material not on the van -> auto-create
+      // the van row; material the shop doesn't track -> result "shop_untracked".
+      if (p === "/api/restock/from-shop" && request.method === "POST") {
+        const body = await request.json().catch(() => ({}));
+        const stTechId = body.st_tech_id;
+        const items = Array.isArray(body.items) ? body.items : null;
+        if (stTechId == null) return json({ error: "st_tech_id required" }, 400);
+        if (!items || !items.length) return json({ error: "items array required" }, 400);
+
+        const van = await env.DB.prepare(
+          `SELECT id, name FROM crm_inventory_locations WHERE type='truck' AND active=1 AND assigned_tech_id = ?`
+        ).bind(stTechId).first();
+        if (!van) return json({ error: "no_van_for_tech", message: "No active van assigned to this tech." }, 404);
+
+        const operator = body.created_by ?? 8;   // crm_users.id — movement created_by
+        const refBase = Date.now() * 1000;
+        const results = [];
+        for (let i = 0; i < items.length; i++) {
+          const it = items[i] || {};
+          const qty = Number(it.quantity ?? it.qty) || 0;
+          try {
+            results.push(await pullShopToVan(env, van.id, it.material_id, qty, operator, refBase + i,
+              { autoCreateVan: true, reportShortfall: true, note: `tech restock from shop (tech ${stTechId})` }));
+          } catch (e) {
+            results.push({ material_id: it.material_id, result: "failed", error: String(e.message || e) });
+          }
+        }
+        return json({ van_id: van.id, van_name: van.name, results });
       }
 
       // --- 6a. Shop (warehouse) stock — full dump for count/levels views --

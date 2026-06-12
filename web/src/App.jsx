@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
-  scanReceipt, savePurchase, saveOverheadPurchase, getJobPurchases, deletePurchase, patchPurchase,
+  scanReceipt, savePurchase, saveOverheadPurchase, restockFromShop, getJobPurchases, deletePurchase, patchPurchase,
   getByCategory, createRequest, receiptPhotoUrl } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 
@@ -119,6 +119,7 @@ function Jobs({ tech, onSignOut }) {
   const [manualId, setManualId] = useState("");
   const [active, setActive] = useState(null); // selected job
   const [overhead, setOverhead] = useState(false); // off-cycle / overhead purchase (no job)
+  const [fromShop, setFromShop] = useState(false); // restock from shop (shop→van transfer)
   const [err, setErr] = useState(false);
 
   useEffect(() => {
@@ -150,6 +151,9 @@ function Jobs({ tech, onSignOut }) {
     // /api/overhead/purchases and logs no matched materials.
     return <ReceiptScan tech={tech} job={{ id: 0, num: "off-cycle", cust: "Off-cycle purchase", overhead: true }}
       onDone={() => setOverhead(false)} onCancel={() => setOverhead(false)} />;
+  }
+  if (fromShop) {
+    return <FromShopRestock tech={tech} onBack={() => setFromShop(false)} />;
   }
 
   const jobs = data ? data.jobs : null;
@@ -188,6 +192,9 @@ function Jobs({ tech, onSignOut }) {
           supplies). Reuses the scanner; writes an overhead-flagged purchase. */}
       <button style={styles.overheadBtn} onClick={() => setOverhead(true)}>
         📋 Off-cycle purchase — not for a job
+      </button>
+      <button style={styles.fromShopBtn} onClick={() => setFromShop(true)}>
+        📦 Restocked from shop — pulled stock to my van
       </button>
 
       {/* Manual entry: auto-shown when there are no jobs / fallback="manual",
@@ -870,6 +877,126 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
   );
 }
 
+// ---- From-shop restock: pull stock from the shop to the tech's van -------
+function FromShopRestock({ tech, onBack }) {
+  const [q, setQ] = useState("");
+  const [results, setResults] = useState([]);
+  const [cart, setCart] = useState([]);          // [{ material_id, name, qty }]
+  const [categories, setCategories] = useState([]);
+  const [openCat, setOpenCat] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [done, setDone] = useState(null);        // per-item results after submit
+  const timer = useRef(null);
+
+  useEffect(() => {
+    clearTimeout(timer.current);
+    if (q.trim().length < 2) { setResults([]); return; }
+    timer.current = setTimeout(() => searchMaterials(q).then(setResults).catch(() => setResults([])), 180);
+    return () => clearTimeout(timer.current);
+  }, [q]);
+  useEffect(() => { getByCategory().then((r) => setCategories(r.categories || [])).catch(() => {}); }, []);
+
+  function addToCart(m) {
+    setCart((c) => {
+      const ex = c.find((x) => x.material_id === m.id);
+      if (ex) return c.map((x) => (x.material_id === m.id ? { ...x, qty: x.qty + 1 } : x));
+      return [...c, { material_id: m.id, name: m.name, qty: 1 }];
+    });
+    setQ(""); setResults([]);
+  }
+  const setQty = (mid, qty) => setCart((c) => c.map((x) => (x.material_id === mid ? { ...x, qty: Math.max(1, qty) } : x)));
+  const removeItem = (mid) => setCart((c) => c.filter((x) => x.material_id !== mid));
+
+  async function submit() {
+    if (!cart.length) return;
+    setBusy(true);
+    try {
+      const r = await restockFromShop(tech.st_tech_id, cart.map((x) => ({ material_id: x.material_id, quantity: x.qty })));
+      const names = Object.fromEntries(cart.map((x) => [x.material_id, x.name]));
+      setDone((r.results || []).map((x) => ({ ...x, name: names[x.material_id] || ("#" + x.material_id) })));
+      setCart([]);
+    } catch (e) {
+      alert("Couldn't restock: " + (e.message || e));
+    } finally { setBusy(false); }
+  }
+
+  if (done) {
+    return (
+      <div style={styles.screen}>
+        <div style={styles.topbar}>
+          <button style={styles.linkBtn} onClick={onBack}>← home</button>
+          <span style={styles.who}>📦 Restocked from shop</span>
+        </div>
+        <h1 style={styles.h1}>Pulled to your van</h1>
+        {done.map((x) =>
+          x.result === "pulled_shop" && x.shop_shortfall ? (
+            <div key={x.material_id} style={styles.fsWarn}>⚠ {x.quantity} × {x.name} — pulled, but the shop went short {x.shop_shortfall}. Flagged for the office.</div>
+          ) : x.result === "pulled_shop" ? (
+            <div key={x.material_id} style={styles.fsOk}>✓ {x.quantity} × {x.name} → your van</div>
+          ) : x.result === "shop_untracked" ? (
+            <div key={x.material_id} style={styles.fsBad}>✗ {x.name} — the shop doesn't track this item; nothing moved.</div>
+          ) : (
+            <div key={x.material_id} style={styles.fsBad}>✗ {x.name} — couldn't pull ({x.error || x.result}).</div>
+          )
+        )}
+        <button style={{ ...styles.primary, marginTop: 14 }} onClick={onBack}>Done</button>
+      </div>
+    );
+  }
+
+  const totalQty = cart.reduce((a, x) => a + x.qty, 0);
+  return (
+    <div style={styles.screen}>
+      <div style={styles.topbar}>
+        <button style={styles.linkBtn} onClick={onBack}>← cancel</button>
+        <span style={styles.who}>📦 Restocked from shop</span>
+      </div>
+      <h1 style={styles.h1}>Restock from shop</h1>
+      <p style={styles.sub}>Pick what you grabbed from the shop. This moves stock <b>shop → your van</b> — no job, no purchase.</p>
+
+      <input style={styles.input} placeholder="Search the catalog…" value={q} onChange={(e) => setQ(e.target.value)} />
+      {results.map((m) => (
+        <button key={m.id} style={{ ...styles.resultRow, cursor: "pointer", width: "100%" }} onClick={() => addToCart(m)}>
+          <span>{m.name}</span><span style={styles.muted}>add +</span>
+        </button>
+      ))}
+
+      {q.trim().length < 2 && (
+        <div style={{ marginTop: 8 }}>
+          {categories.map((cat) => (
+            <div key={cat.name}>
+              <button style={styles.catRow} onClick={() => setOpenCat((o) => (o === cat.name ? null : cat.name))}>
+                {cat.name} <span style={styles.muted}>({cat.count}) {openCat === cat.name ? "▾" : "▸"}</span>
+              </button>
+              {openCat === cat.name && cat.items.map((m) => (
+                <button key={m.id} style={{ ...styles.resultRow, cursor: "pointer", width: "100%" }} onClick={() => addToCart(m)}>
+                  <span>{m.name}</span><span style={styles.muted}>add +</span>
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {cart.length > 0 && (
+        <div style={styles.fsCart}>
+          <div style={styles.sectionLabel}>Grabbed · {cart.length} item{cart.length === 1 ? "" : "s"}</div>
+          {cart.map((x) => (
+            <div key={x.material_id} style={styles.fsCartRow}>
+              <span style={styles.fsCartName}>{x.name}</span>
+              <button style={styles.qtyBtn} onClick={() => setQty(x.material_id, x.qty - 1)}>−</button>
+              <span style={styles.fsQty}>{x.qty}</span>
+              <button style={styles.qtyBtn} onClick={() => setQty(x.material_id, x.qty + 1)}>+</button>
+              <button style={styles.linkBtn} onClick={() => removeItem(x.material_id)}>×</button>
+            </div>
+          ))}
+          <button style={{ ...styles.primary, marginTop: 10 }} disabled={busy} onClick={submit}>{busy ? "Moving…" : `Move ${totalQty} to my van`}</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 const styles = {
   screen: { maxWidth: 480, margin: "0 auto", padding: 16, fontFamily: "system-ui, sans-serif" },
   h1: { fontSize: 22, fontWeight: 600, margin: "8px 0 4px" },
@@ -906,6 +1033,16 @@ const styles = {
   rcptFree: { fontSize: 13, color: "#999", fontStyle: "italic", flex: 1 },
   rcptDel: { width: 32, height: 32, flex: "none", marginLeft: "auto", fontSize: 18, lineHeight: "32px", border: "none", borderRadius: 6, background: "#c0392b", color: "#fff", cursor: "pointer", padding: 0 },
   resultRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fff" },
+  fromShopBtn: { display: "block", width: "100%", boxSizing: "border-box", padding: "14px 16px", marginTop: 10, fontSize: 15, fontWeight: 500, background: "#eef5f0", color: "#1e5a3a", border: "1px solid #bcd9c2", borderRadius: 10, cursor: "pointer", textAlign: "left" },
+  catRow: { display: "block", width: "100%", textAlign: "left", padding: "12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fafafa", fontSize: 15, cursor: "pointer" },
+  fsCart: { marginTop: 16, padding: "12px", border: "1px solid #cfe0d0", borderRadius: 10, background: "#f3f8f3" },
+  fsCartRow: { display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid #e6efe6" },
+  fsCartName: { flex: 1, fontSize: 15 },
+  qtyBtn: { width: 32, height: 32, fontSize: 18, fontWeight: 600, border: "1px solid #bbb", borderRadius: 8, background: "#fff", cursor: "pointer" },
+  fsQty: { minWidth: 28, textAlign: "center", fontSize: 16, fontWeight: 600 },
+  fsOk: { fontSize: 15, color: "#1e7e34", padding: "8px 10px", background: "#eef6ef", borderRadius: 8, marginBottom: 6 },
+  fsWarn: { fontSize: 14, color: "#8a5a00", padding: "8px 10px", background: "#fff6e6", border: "1px solid #e8c878", borderRadius: 8, marginBottom: 6 },
+  fsBad: { fontSize: 14, color: "#a32d2d", padding: "8px 10px", background: "#fcebeb", borderRadius: 8, marginBottom: 6 },
   addBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#1d9e75", color: "#fff", cursor: "pointer" },
   browseSection: { marginTop: 10 },
   browseLabel: { fontSize: 13, fontWeight: 600, color: "#555", marginBottom: 8 },

@@ -105,6 +105,20 @@ export async function saveOverheadPurchase(body) {
   return d;
 }
 
+// Tech-initiated restock FROM SHOP — pure shop→van inventory transfer (no job,
+// no purchase). items: [{ material_id, quantity }]. Worker resolves the van from
+// st_tech_id. Returns { van_id, van_name, results:[{material_id, result,
+// quantity, shop_shortfall?}] }.
+export async function restockFromShop(stTechId, items) {
+  const r = await fetch(`${API}/api/restock/from-shop`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ st_tech_id: stTechId, items }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("restock " + r.status));
+  return d;
+}
+
 // GET a job's saved receipts -> { purchases:[{ id, supplier, subtotal, tax,
 // receipt_total, created_at, lines:[matched materials] }] }.
 export async function getJobPurchases(jobId) {

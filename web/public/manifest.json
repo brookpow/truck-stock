@@ -4,8 +4,8 @@
   "description": "Log materials used on jobs",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f7f7f5",
-  "theme_color": "#185fa5",
+  "background_color": "#F4F5F7",
+  "theme_color": "#0B63F6",
   "orientation": "portrait",
   "icons": [
     {

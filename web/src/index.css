@@ -1,0 +1,37 @@
+/* Field-Modern base — self-hosted fonts imported in main.jsx. Inline styles carry
+   the component look; this file provides what inline can't: font inheritance on
+   controls, focus rings, and the motion (keyframes / hover-lift / press). */
+
+* { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+button, input, select, textarea { font-family: inherit; }
+
+/* uniform, gentle press feedback on every control (no behavior change) */
+button { transition: transform .1s ease; }
+button:active:not(:disabled) { transform: scale(.985); }
+
+/* blue focus ring (inline styles can't express :focus) */
+input:focus, select:focus, textarea:focus {
+  outline: none; border-color: #0B63F6 !important;
+  box-shadow: 0 0 0 3px rgba(11,99,246,.16);
+}
+
+/* ── motion: high-impact moments only ── */
+@keyframes fm-rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+@keyframes fm-glow { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 rgba(24,169,87,.5); } 50% { opacity: .5; box-shadow: 0 0 0 4px rgba(24,169,87,0); } }
+
+.fm-stagger > * { animation: fm-rise .5s cubic-bezier(.2,.7,.2,1) both; }
+.fm-stagger > *:nth-child(1){animation-delay:.03s} .fm-stagger > *:nth-child(2){animation-delay:.07s}
+.fm-stagger > *:nth-child(3){animation-delay:.11s} .fm-stagger > *:nth-child(4){animation-delay:.15s}
+.fm-stagger > *:nth-child(5){animation-delay:.19s} .fm-stagger > *:nth-child(6){animation-delay:.23s}
+.fm-stagger > *:nth-child(7){animation-delay:.27s} .fm-stagger > *:nth-child(8){animation-delay:.31s}
+.fm-stagger > *:nth-child(9){animation-delay:.35s} .fm-stagger > *:nth-child(n+10){animation-delay:.39s}
+
+.fm-lift { transition: transform .16s ease, box-shadow .16s ease; }
+.fm-lift:hover { transform: translateY(-3px); box-shadow: 0 2px 4px rgba(20,21,26,.05), 0 22px 48px -16px rgba(20,21,26,.22); }
+
+.fm-glow { animation: fm-glow 1.6s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .fm-stagger > *, .fm-glow { animation: none !important; }
+  .fm-lift { transition: none; }
+}

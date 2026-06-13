@@ -3,6 +3,7 @@ import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMateri
   scanReceipt, savePurchase, saveOverheadPurchase, restockFromShop, getJobPurchases, deletePurchase, patchPurchase,
   getByCategory, createRequest, receiptPhotoUrl } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
+import { C, FONT, DISP, SHADOW, BADGE } from "./theme.js";
 
 const fmt = (n) => "$" + (Number(n) || 0).toFixed(2);
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100; // round to cents
@@ -75,11 +76,11 @@ function PickTech({ onPick }) {
 // the on-site (Working) jobs out as "Current" and highlight them; Dispatched
 // (en route) + Scheduled fall under "Upcoming". Tapping any job opens Capture.
 const STATUS_BADGE = {
-  Working:    { label: "● On site", color: "#1d7a4d", bg: "#e6f5ed" },  // green
-  Dispatched: { label: "En route",  color: "#6b3fa0", bg: "#efe7fb" },  // purple
-  Scheduled:  { label: "Scheduled", color: "#555",    bg: "#eee" },     // grey
-  Done:       { label: "Done",      color: "#8a6a00", bg: "#fbf0c8" },  // yellow (finished)
-  Paused:     { label: "Paused",    color: "#8a6a00", bg: "#fbf0c8" },  // yellow (awaiting review)
+  Working:    { label: "On site",   fg: C.greenInk,  bg: C.greenWash },
+  Dispatched: { label: "En route",  fg: C.purpleInk, bg: C.purpleWash },
+  Scheduled:  { label: "Scheduled", fg: C.ink2,      bg: C.sunk },
+  Done:       { label: "Done",      fg: C.amberInk,  bg: C.amberWash },
+  Paused:     { label: "Paused",    fg: C.amberInk,  bg: C.amberWash },
 };
 // Map the worker's job shape onto what Capture expects (id / num / cust),
 // carrying status + address + start for the list UI.
@@ -97,17 +98,27 @@ const fmtTime = (iso) => {
 
 function JobCard({ job, onTap, current, recent }) {
   const b = STATUS_BADGE[job.status] || STATUS_BADGE.Scheduled;
-  const rowStyle = current ? styles.jobRowCurrent : recent ? styles.jobRowRecent : styles.jobRow;
+  const meta = (job.addr || ("Job " + job.num)) + (job.start ? " · " + fmtTime(job.start) : "");
+  // On-site job = dark hero card: the one job you're on, readable across a cab.
+  if (current) {
+    return (
+      <button style={styles.heroCard} className="fm-press" onClick={onTap}>
+        <div style={styles.heroTop}>
+          <span style={styles.heroCust}>{job.cust || ("Job " + job.num)}</span>
+          <span style={styles.heroChip}><span style={styles.heroDot} className="fm-glow" />On site</span>
+        </div>
+        <div style={styles.heroMeta}>{meta}</div>
+        <div style={styles.heroAction}>Log materials <span style={{ fontWeight: 800 }}>→</span></div>
+      </button>
+    );
+  }
   return (
-    <button style={rowStyle} onClick={onTap}>
+    <button style={recent ? styles.jobRowRecent : styles.jobRow} className="fm-press" onClick={onTap}>
       <div style={styles.jobRowTop}>
         <span style={styles.jobCust}>{job.cust || ("Job " + job.num)}</span>
-        <span style={{ ...styles.badge, color: b.color, background: b.bg }}>{b.label}</span>
+        <span style={{ ...styles.badge, color: b.fg, background: b.bg }}>{b.label}</span>
       </div>
-      <div style={styles.muted}>
-        {job.addr || ("Job " + job.num)}{job.start ? " · " + fmtTime(job.start) : ""}
-      </div>
-      {current && <div style={styles.tapHint}>tap to log materials</div>}
+      <div style={styles.muted}>{meta}</div>
       {recent && <div style={styles.recentHint}>tap to add a forgotten material</div>}
     </button>
   );
@@ -190,11 +201,23 @@ function Jobs({ tech, onSignOut }) {
 
       {/* Off-cycle / overhead purchase — a receipt with no job (consumables, shop
           supplies). Reuses the scanner; writes an overhead-flagged purchase. */}
-      <button style={styles.overheadBtn} onClick={() => setOverhead(true)}>
-        📋 Off-cycle purchase — not for a job
+      <button style={styles.actRow} className="fm-press" onClick={() => setOverhead(true)}>
+        <span style={{ ...styles.actIco, color: C.amberInk, background: C.amberWash }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 3h11l3 3v15H5z" /><path d="M9 8h6M9 12h6M9 16h4" /></svg>
+        </span>
+        <span style={styles.actText}>
+          <span style={styles.actTitle}>Off-cycle purchase</span>
+          <span style={styles.actDesc}>A receipt that's not for a job</span>
+        </span>
       </button>
-      <button style={styles.fromShopBtn} onClick={() => setFromShop(true)}>
-        📦 Restocked from shop — pulled stock to my van
+      <button style={styles.actRow} className="fm-press" onClick={() => setFromShop(true)}>
+        <span style={{ ...styles.actIco, color: C.greenInk, background: C.greenWash }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8l9-5 9 5-9 5z" /><path d="M3 8v8l9 5 9-5V8" /></svg>
+        </span>
+        <span style={styles.actText}>
+          <span style={styles.actTitle}>Restocked from shop</span>
+          <span style={styles.actDesc}>Pulled stock to my van</span>
+        </span>
       </button>
 
       {/* Manual entry: auto-shown when there are no jobs / fallback="manual",
@@ -997,83 +1020,95 @@ function FromShopRestock({ tech, onBack }) {
   );
 }
 
+const card = { background: C.surface, borderRadius: 16, boxShadow: SHADOW.e1, border: "none" };
+const ctl = { border: `1px solid ${C.hair}`, borderRadius: 12, background: C.surface, boxSizing: "border-box", color: C.ink };
 const styles = {
-  screen: { maxWidth: 480, margin: "0 auto", padding: 16, fontFamily: "system-ui, sans-serif" },
-  h1: { fontSize: 22, fontWeight: 600, margin: "8px 0 4px" },
-  sub: { fontSize: 14, color: "#555", margin: "0 0 12px" },
-  muted: { fontSize: 13, color: "#777" },
-  error: { fontSize: 14, color: "#a32d2d", padding: 8, background: "#fcebeb", borderRadius: 8, margin: "8px 0" },
+  screen: { maxWidth: 480, margin: "0 auto", padding: 16, fontFamily: FONT, color: C.ink },
+  h1: { fontFamily: DISP, fontSize: 27, fontWeight: 800, letterSpacing: "-.035em", margin: "8px 0 6px", color: C.ink },
+  sub: { fontSize: 14, color: C.ink3, margin: "0 0 12px" },
+  muted: { fontSize: 13.5, color: C.ink3 },
+  error: { fontSize: 14, color: C.redInk, padding: "10px 12px", background: C.redWash, borderRadius: 12, margin: "8px 0" },
   failBox: { textAlign: "center", padding: "18px 8px" },
-  failTitle: { fontSize: 18, fontWeight: 600, color: "#a32d2d", marginBottom: 8 },
-  topbar: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 },
-  who: { fontSize: 14, fontWeight: 500 },
-  linkBtn: { background: "none", border: "none", color: "#185fa5", fontSize: 14, padding: 4, cursor: "pointer" },
-  bigRow: { display: "block", width: "100%", textAlign: "left", padding: "16px", fontSize: 17, marginBottom: 8, border: "1px solid #ddd", borderRadius: 10, background: "#fff", cursor: "pointer" },
-  jobRow: { display: "block", width: "100%", textAlign: "left", padding: "14px", marginBottom: 8, border: "1px solid #ddd", borderRadius: 10, background: "#fff", cursor: "pointer" },
-  jobRowCurrent: { display: "block", width: "100%", textAlign: "left", padding: "14px", marginBottom: 8, border: "2px solid #1d9e75", borderRadius: 10, background: "#f1faf5", cursor: "pointer" },
+  failTitle: { fontFamily: DISP, fontSize: 19, fontWeight: 700, color: C.redInk, marginBottom: 8 },
+  topbar: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 },
+  who: { fontSize: 14, fontWeight: 600, color: C.ink2 },
+  linkBtn: { background: "none", border: "none", color: C.blue, fontSize: 14, padding: 6, cursor: "pointer", fontWeight: 600 },
+  bigRow: { ...card, display: "block", width: "100%", textAlign: "left", padding: "18px", fontFamily: DISP, fontSize: 18, fontWeight: 700, letterSpacing: "-.02em", color: C.ink, marginBottom: 10, borderRadius: 16, cursor: "pointer" },
+  jobRow: { ...card, display: "block", width: "100%", textAlign: "left", padding: "15px 16px", marginBottom: 11, borderRadius: 18, cursor: "pointer" },
   jobRowTop: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 },
-  jobCust: { fontWeight: 600, fontSize: 16, flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-  badge: { fontSize: 12, fontWeight: 600, padding: "2px 8px", borderRadius: 999, whiteSpace: "nowrap", flex: "none" },
-  tapHint: { fontSize: 12, color: "#1d7a4d", marginTop: 4 },
-  sectionLabel: { fontSize: 12, fontWeight: 600, color: "#999", textTransform: "uppercase", letterSpacing: "0.04em", margin: "14px 0 6px" },
-  jobRowRecent: { display: "block", width: "100%", textAlign: "left", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fafafa", cursor: "pointer", opacity: 0.85 },
-  recentSection: { marginTop: 22, paddingTop: 6, borderTop: "1px solid #eee" },
-  recentHint: { fontSize: 12, color: "#8a6a00", marginTop: 4 },
-  manualToggle: { background: "none", border: "none", color: "#185fa5", fontSize: 14, padding: "10px 0", marginTop: 6, cursor: "pointer", textAlign: "left", display: "block" },
-  overheadBtn: { display: "block", width: "100%", boxSizing: "border-box", padding: "14px 16px", marginTop: 18, fontSize: 15, fontWeight: 500, background: "#fbf7ef", color: "#7a5b16", border: "1px solid #e3d3ad", borderRadius: 10, cursor: "pointer", textAlign: "left" },
-  overheadNote: { fontSize: 13, color: "#7a5b16", background: "#fbf7ef", border: "1px solid #e3d3ad", borderRadius: 8, padding: "8px 10px", margin: "0 0 12px" },
-  input: { width: "100%", height: 48, fontSize: 16, padding: "0 12px", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, marginBottom: 10 },
-  primary: { width: "100%", height: 48, fontSize: 16, fontWeight: 500, background: "#185fa5", color: "#fff", border: "none", borderRadius: 10, cursor: "pointer" },
-  scanBtn: { display: "block", width: "100%", boxSizing: "border-box", height: 46, fontSize: 15, fontWeight: 500, background: "#fff", color: "#185fa5", border: "1px solid #185fa5", borderRadius: 10, cursor: "pointer", marginBottom: 12, textAlign: "center" },
-  rcptLine: { border: "1px solid #e2e2e2", borderRadius: 10, padding: "8px 10px", marginBottom: 8, background: "#fff" },
-  rcptDesc: { width: "100%", height: 38, fontSize: 15, padding: "0 8px", boxSizing: "border-box", border: "1px solid #ddd", borderRadius: 8, marginBottom: 6 },
+  jobCust: { fontFamily: DISP, fontWeight: 700, fontSize: 17, letterSpacing: "-.02em", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.ink },
+  badge: { fontSize: 12, fontWeight: 600, padding: "4px 10px", borderRadius: 999, whiteSpace: "nowrap", flex: "none" },
+  sectionLabel: { fontSize: 11, fontWeight: 700, color: C.ink3, textTransform: "uppercase", letterSpacing: "0.08em", margin: "20px 4px 9px" },
+  jobRowRecent: { ...card, display: "block", width: "100%", textAlign: "left", padding: "13px 15px", marginBottom: 9, borderRadius: 15, cursor: "pointer", opacity: 0.75 },
+  recentSection: { marginTop: 24, paddingTop: 8, borderTop: `1px solid ${C.hair}` },
+  recentHint: { fontSize: 12, color: C.amberInk, marginTop: 4 },
+  // on-site hero — the one job you're on, readable across a cab
+  heroCard: { display: "block", width: "100%", textAlign: "left", border: "none", cursor: "pointer", borderRadius: 22, padding: 18, marginBottom: 12, color: "#fff", background: "linear-gradient(155deg,#212430 0%,#14151A 62%)", boxShadow: SHADOW.e2 },
+  heroTop: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 },
+  heroCust: { fontFamily: DISP, fontWeight: 700, fontSize: 21, letterSpacing: "-.02em", color: "#fff", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  heroChip: { display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12, fontWeight: 600, padding: "5px 11px", borderRadius: 999, background: "rgba(255,255,255,.12)", color: "#7BE6A8", flex: "none" },
+  heroDot: { width: 7, height: 7, borderRadius: 999, background: "#34C759", display: "inline-block", flex: "none" },
+  heroMeta: { color: "#AEB1BB", fontSize: 13.5, marginTop: 6 },
+  heroAction: { marginTop: 15, height: 50, borderRadius: 14, background: "#fff", color: C.ink, fontWeight: 700, fontSize: 15.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 8 },
+  // action rows (off-cycle / from-shop)
+  actRow: { ...card, display: "flex", alignItems: "center", gap: 13, width: "100%", textAlign: "left", cursor: "pointer", marginTop: 11, padding: "15px 16px", borderRadius: 16 },
+  actIco: { width: 42, height: 42, borderRadius: 12, flex: "none", display: "grid", placeItems: "center" },
+  actText: { display: "flex", flexDirection: "column", minWidth: 0 },
+  actTitle: { fontWeight: 700, fontSize: 14.5, color: C.ink },
+  actDesc: { fontSize: 12, color: C.ink3, marginTop: 1 },
+  manualToggle: { background: "none", border: "none", color: C.blue, fontSize: 14, padding: "12px 0", marginTop: 6, cursor: "pointer", textAlign: "left", display: "block", fontWeight: 600 },
+  overheadNote: { fontSize: 13, color: C.amberInk, background: C.amberWash, borderRadius: 12, padding: "10px 12px", margin: "0 0 12px" },
+  input: { ...ctl, width: "100%", height: 52, fontSize: 16, padding: "0 14px", marginBottom: 10 },
+  primary: { width: "100%", height: 52, fontSize: 16, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer" },
+  scanBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
+  rcptLine: { ...card, borderRadius: 14, padding: "10px 12px", marginBottom: 8 },
+  rcptDesc: { ...ctl, width: "100%", height: 40, fontSize: 15, padding: "0 10px", marginBottom: 6 },
   rcptRow2: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },
-  rcptNum: { width: 58, height: 34, fontSize: 14, textAlign: "right", padding: "0 6px", boxSizing: "border-box", border: "1px solid #ddd", borderRadius: 6 },
-  rcptMatch: { fontSize: 13, color: "#1d7a4d", display: "flex", alignItems: "center", gap: 4, flex: 1, minWidth: 60 },
-  rcptFree: { fontSize: 13, color: "#999", fontStyle: "italic", flex: 1 },
-  rcptDel: { width: 32, height: 32, flex: "none", marginLeft: "auto", fontSize: 18, lineHeight: "32px", border: "none", borderRadius: 6, background: "#c0392b", color: "#fff", cursor: "pointer", padding: 0 },
-  resultRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fff" },
-  fromShopBtn: { display: "block", width: "100%", boxSizing: "border-box", padding: "14px 16px", marginTop: 10, fontSize: 15, fontWeight: 500, background: "#eef5f0", color: "#1e5a3a", border: "1px solid #bcd9c2", borderRadius: 10, cursor: "pointer", textAlign: "left" },
-  catRow: { display: "block", width: "100%", textAlign: "left", padding: "12px", marginBottom: 6, border: "1px solid #eee", borderRadius: 10, background: "#fafafa", fontSize: 15, cursor: "pointer" },
-  fsCart: { marginTop: 16, padding: "12px", border: "1px solid #cfe0d0", borderRadius: 10, background: "#f3f8f3" },
-  fsCartRow: { display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid #e6efe6" },
-  fsCartName: { flex: 1, fontSize: 15 },
-  qtyBtn: { width: 32, height: 32, fontSize: 18, fontWeight: 600, border: "1px solid #bbb", borderRadius: 8, background: "#fff", cursor: "pointer" },
-  fsQty: { minWidth: 28, textAlign: "center", fontSize: 16, fontWeight: 600 },
-  fsOk: { fontSize: 15, color: "#1e7e34", padding: "8px 10px", background: "#eef6ef", borderRadius: 8, marginBottom: 6 },
-  fsWarn: { fontSize: 14, color: "#8a5a00", padding: "8px 10px", background: "#fff6e6", border: "1px solid #e8c878", borderRadius: 8, marginBottom: 6 },
-  fsBad: { fontSize: 14, color: "#a32d2d", padding: "8px 10px", background: "#fcebeb", borderRadius: 8, marginBottom: 6 },
-  addBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#1d9e75", color: "#fff", cursor: "pointer" },
+  rcptNum: { ...ctl, width: 58, height: 36, fontSize: 14, textAlign: "right", padding: "0 8px", borderRadius: 10 },
+  rcptMatch: { fontSize: 13, color: C.greenInk, display: "flex", alignItems: "center", gap: 4, flex: 1, minWidth: 60 },
+  rcptFree: { fontSize: 13, color: C.ink3, fontStyle: "italic", flex: 1 },
+  rcptDel: { width: 34, height: 34, flex: "none", marginLeft: "auto", fontSize: 18, lineHeight: "34px", border: "none", borderRadius: 9, background: C.redWash, color: C.redInk, cursor: "pointer", padding: 0 },
+  resultRow: { ...card, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px", marginBottom: 8, borderRadius: 14 },
+  catRow: { ...card, display: "block", width: "100%", textAlign: "left", padding: "14px", marginBottom: 8, borderRadius: 14, fontSize: 15, fontWeight: 500, color: C.ink, cursor: "pointer" },
+  fsCart: { ...card, marginTop: 16, padding: "14px", borderRadius: 16 },
+  fsCartRow: { display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: `1px solid ${C.hair}` },
+  fsCartName: { flex: 1, fontSize: 15, color: C.ink },
+  qtyBtn: { width: 40, height: 40, fontSize: 20, fontWeight: 600, border: `1px solid ${C.hair}`, borderRadius: 11, background: C.surface, color: C.ink, cursor: "pointer" },
+  fsQty: { minWidth: 30, textAlign: "center", fontSize: 16, fontWeight: 700, color: C.ink },
+  fsOk: { fontSize: 15, color: C.greenInk, padding: "10px 12px", background: C.greenWash, borderRadius: 10, marginBottom: 6 },
+  fsWarn: { fontSize: 14, color: C.amberInk, padding: "10px 12px", background: C.amberWash, borderRadius: 10, marginBottom: 6 },
+  fsBad: { fontSize: 14, color: C.redInk, padding: "10px 12px", background: C.redWash, borderRadius: 10, marginBottom: 6 },
+  addBtn: { width: 48, height: 48, flex: "none", marginLeft: 8, fontSize: 26, lineHeight: "48px", border: "none", borderRadius: 13, background: C.blue, color: "#fff", cursor: "pointer" },
   browseSection: { marginTop: 10 },
-  browseLabel: { fontSize: 13, fontWeight: 600, color: "#555", marginBottom: 8 },
+  browseLabel: { fontSize: 11, fontWeight: 700, color: C.ink3, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 },
   catBlock: { marginBottom: 6 },
-  catHeader: { display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", padding: "12px 14px", border: "1px solid #ddd", borderRadius: 10, background: "#fafafa", cursor: "pointer", fontSize: 15, fontWeight: 500, boxSizing: "border-box" },
-  catItemRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px 8px 18px", marginLeft: 8, borderLeft: "2px solid #eee" },
+  catHeader: { ...card, display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", padding: "14px", borderRadius: 14, cursor: "pointer", fontSize: 15, fontWeight: 600, color: C.ink, boxSizing: "border-box" },
+  catItemRow: { display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 10px 10px 18px", marginLeft: 8, borderLeft: `2px solid ${C.hair}` },
   reqSection: { marginTop: 14 },
-  reqEntry: { width: "100%", padding: "12px 14px", border: "1px dashed #bbb", borderRadius: 10, background: "#fff", cursor: "pointer", fontSize: 15, color: "#185fa5", boxSizing: "border-box" },
-  reqForm: { border: "1px solid #ddd", borderRadius: 10, padding: 12 },
+  reqEntry: { width: "100%", padding: "14px", border: `1.5px dashed ${C.hair}`, borderRadius: 14, background: C.surface, cursor: "pointer", fontSize: 15, fontWeight: 600, color: C.blue, boxSizing: "border-box" },
+  reqForm: { ...card, borderRadius: 16, padding: 14 },
   reqRow: { display: "flex", alignItems: "center", gap: 8, marginBottom: 10 },
-  reqQtyInput: { width: 70, height: 44, fontSize: 16, textAlign: "center", border: "1px solid #ccc", borderRadius: 10, boxSizing: "border-box" },
-  delBtn: { width: 44, height: 44, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "44px", border: "none", borderRadius: 10, background: "#c0392b", color: "#fff", cursor: "pointer" },
-  taxBox: { border: "1px solid #ddd", borderRadius: 10, padding: "10px 12px", margin: "10px 0" },
+  reqQtyInput: { ...ctl, width: 70, height: 48, fontSize: 16, textAlign: "center", borderRadius: 12 },
+  delBtn: { width: 48, height: 48, flex: "none", marginLeft: 8, fontSize: 24, lineHeight: "48px", border: "none", borderRadius: 13, background: C.redWash, color: C.redInk, cursor: "pointer" },
+  taxBox: { ...card, borderRadius: 14, padding: "10px 12px", margin: "10px 0" },
   taxRow: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "3px 0" },
-  taxInput: { width: 96, height: 36, fontSize: 15, textAlign: "right", padding: "0 8px", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 8 },
-  taxVal: { fontSize: 15 },
+  taxInput: { ...ctl, width: 96, height: 38, fontSize: 15, textAlign: "right", padding: "0 8px", borderRadius: 10 },
+  taxVal: { fontSize: 15, color: C.ink },
   receiptsSection: { marginTop: 16 },
-  receiptsLabel: { fontSize: 13, fontWeight: 600, color: "#8a5a00", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 },
-  receiptCard: { border: "1px solid #e8e0cf", borderRadius: 10, background: "#fffdf6", marginBottom: 8 },
-  receiptHead: { display: "flex", alignItems: "center", padding: "8px 10px", gap: 6 },
+  receiptsLabel: { fontSize: 11, fontWeight: 700, color: C.amberInk, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 },
+  receiptCard: { ...card, borderLeft: `4px solid ${C.amber}`, marginBottom: 8 },
+  receiptHead: { display: "flex", alignItems: "center", padding: "10px 12px", gap: 6 },
   receiptToggle: { flex: 1, minWidth: 0, display: "flex", flexDirection: "column", alignItems: "flex-start", gap: 2, background: "none", border: "none", textAlign: "left", cursor: "pointer", padding: 0 },
-  receiptBody: { padding: "0 12px 10px", display: "flex", flexDirection: "column", gap: 4 },
-  thumb: { marginTop: 6, width: 120, height: 120, objectFit: "cover", borderRadius: 8, border: "1px solid #ddd", cursor: "pointer" },
-  editBtnSm: { flex: "none", height: 32, fontSize: 13, padding: "0 10px", border: "1px solid #185fa5", borderRadius: 6, background: "#fff", color: "#185fa5", cursor: "pointer" },
-  delBtnSm: { width: 32, height: 32, flex: "none", fontSize: 18, lineHeight: "32px", border: "none", borderRadius: 6, background: "#c0392b", color: "#fff", cursor: "pointer", padding: 0 },
-  qtyInput: { width: 52, height: 44, flex: "none", marginLeft: 8, fontSize: 16, textAlign: "center", boxSizing: "border-box", border: "1px solid #ccc", borderRadius: 10, padding: "0 4px" },
-  totalBar: { display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: "1px solid #ddd", paddingTop: 12, marginTop: 12, marginBottom: 8 },
-  inclPending: { color: "#8a5a00", fontStyle: "italic" },
-  loggedRow: { display: "flex", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #eee" },
-  pendingRow: { display: "flex", alignItems: "center", padding: "8px 0", borderBottom: "1px dashed #ddd", opacity: 0.6 },
-  syncBanner: { display: "block", width: "100%", textAlign: "left", font: "inherit", fontSize: 13, color: "#8a5a00", background: "#fff5e0", border: "1px solid #f0d68a", borderRadius: 8, padding: "10px", marginBottom: 10, cursor: "pointer" },
-  note: { fontSize: 13, color: "#185fa5", background: "#eaf2fb", border: "1px solid #bcd6f2", borderRadius: 8, padding: "8px 10px", marginBottom: 10 },
-  ellip: { fontSize: 15, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+  receiptBody: { padding: "0 12px 12px", display: "flex", flexDirection: "column", gap: 5 },
+  thumb: { marginTop: 6, width: 120, height: 120, objectFit: "cover", borderRadius: 12, border: `1px solid ${C.hair}`, cursor: "pointer" },
+  editBtnSm: { flex: "none", height: 34, fontSize: 13, fontWeight: 600, padding: "0 12px", border: `1px solid ${C.hair}`, borderRadius: 9, background: C.surface, color: C.ink, cursor: "pointer" },
+  delBtnSm: { width: 34, height: 34, flex: "none", fontSize: 18, lineHeight: "34px", border: "none", borderRadius: 9, background: C.redWash, color: C.redInk, cursor: "pointer", padding: 0 },
+  qtyInput: { ...ctl, width: 54, height: 48, flex: "none", marginLeft: 8, fontSize: 16, textAlign: "center", padding: "0 4px", borderRadius: 12 },
+  totalBar: { display: "flex", justifyContent: "space-between", alignItems: "baseline", borderTop: `1px solid ${C.hair}`, paddingTop: 12, marginTop: 12, marginBottom: 8 },
+  inclPending: { color: C.amberInk, fontStyle: "italic" },
+  loggedRow: { display: "flex", alignItems: "center", padding: "10px 0", borderBottom: `1px solid ${C.hair}` },
+  pendingRow: { display: "flex", alignItems: "center", padding: "10px 0", borderBottom: `1px dashed ${C.hair}`, opacity: 0.55 },
+  syncBanner: { display: "block", width: "100%", textAlign: "left", font: "inherit", fontSize: 13, fontWeight: 600, color: C.amberInk, background: C.amberWash, borderRadius: 12, padding: "11px 12px", marginBottom: 10, cursor: "pointer", border: "none" },
+  note: { fontSize: 13, fontWeight: 500, color: C.blueInk, background: C.blueWash, borderRadius: 12, padding: "10px 12px", marginBottom: 10 },
+  ellip: { fontSize: 15, fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", color: C.ink },
 };

@@ -813,6 +813,30 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
     }
   }
 
+  // Scan failed (or the tech can't read the total in the field): save the PHOTO
+  // now with a $0 placeholder so the office reads the image and adds the costs
+  // later (Receipts screen → edit). The worker accepts a $0 receipt; the photo
+  // still goes to R2.
+  async function savePhotoOnly() {
+    if (!imgB64) { alert("No photo captured yet — retake it."); return; }
+    setPhase("saving");
+    try {
+      const body = {
+        tech_id: tech.st_tech_id,
+        supplier: supplier.trim() || "Costs pending — see photo",
+        subtotal: 0, tax: 0, total: 0,
+        image_base64: imgB64, media_type: imgMedia,
+        description: "Scan failed — photo saved; office to add costs from the receipt.",
+        items: [],
+      };
+      const res = job.overhead ? await saveOverheadPurchase(body) : await savePurchase(job.id, body);
+      onDone(res);
+    } catch (e) {
+      alert("Couldn't upload the photo: " + (e.message || e));
+      setPhase("failed");
+    }
+  }
+
   return (
     <div style={styles.screen}>
       <div style={styles.topbar}>
@@ -839,9 +863,10 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
       {phase === "failed" && (
         <div style={styles.failBox}>
           <div style={styles.failTitle}>Couldn't scan the receipt</div>
-          <p style={styles.sub}>Scanning's busy right now (or it couldn't read the photo). Try again in a moment, or enter the receipt details by hand — the photo you took is still saved either way.</p>
-          <button style={styles.primary} onClick={() => setPhase("capture")}>↻ Try again</button>
-          <button style={styles.scanBtn} onClick={startManual}>Enter details manually</button>
+          <p style={styles.sub}>The scanner's busy or couldn't read it — but your photo is fine. Upload just the photo and the office adds the costs, enter the costs by hand, or re-scan.</p>
+          {imgB64 && <button style={styles.primary} onClick={savePhotoOnly}>📷 Upload photo only — office adds the costs</button>}
+          <button style={styles.scanBtn} onClick={startManual}>Enter the costs by hand</button>
+          <button style={styles.scanBtn} onClick={() => setPhase("capture")}>↻ Try the scan again</button>
         </div>
       )}
 
@@ -893,6 +918,7 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
           <button style={styles.primary} disabled={phase === "saving"} onClick={save}>
             {phase === "saving" ? "Saving…" : "Save purchase"}
           </button>
+          {imgB64 && <button style={styles.scanBtn} disabled={phase === "saving"} onClick={savePhotoOnly}>📷 Or just save the photo — add the costs in the office</button>}
           <button style={styles.scanBtn} onClick={() => setPhase("capture")}>↺ retake photo</button>
         </>
       )}

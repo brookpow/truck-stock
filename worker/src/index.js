@@ -16,7 +16,7 @@
 //   If your real schema differs, Claude Code should run PRAGMA table_info on both
 //   and adjust the column names below. Marked with  // VERIFY  comments.
 
-import { authenticate, signJWT, verifyPassword } from "./auth.js";
+import { authenticate, signJWT, verifyPassword, hashPassword } from "./auth.js";
 
 const json = (data, status = 200) =>
   new Response(JSON.stringify(data), {
@@ -28,6 +28,7 @@ const cors = () => ({
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,POST,PATCH,DELETE,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Expose-Headers": "X-TS-Token",   // refresh-on-use token for the tech app
 });
 
 // Pacific (America/Vancouver) calendar day as UTC bounds, DST-correct.
@@ -42,6 +43,52 @@ const cors = () => ({
 const RECEIPT_TAG_PREFIX = "receipt purchase #";
 const receiptTag = (purchaseId) => RECEIPT_TAG_PREFIX + purchaseId;
 const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+
+// ── Phase 2 tech auth (T1: endpoints live, tech-write enforcement OFF) ──
+const TECH_TOKEN_TTL = 2592000;        // 30 days
+const TECH_REFRESH_AFTER = 1296000;    // re-issue once a token is past half-life (15d)
+const PIN_MAX_FAILS = 5, PIN_LOCK_MINUTES = 15;
+const IP_WINDOW_SEC = 60, IP_MAX_ATTEMPTS = 30;
+
+// Verify a Bearer token as a TECH token: account:'tech' AND token_version still
+// matches crm_techs (a revoke bump invalidates every device) AND the tech is
+// active. Returns { payload, refresh, fresh } or null. `fresh` is a re-signed 30d
+// token when the current one is past half-life — surfaced via the X-TS-Token header.
+async function techAuth(request, env) {
+  const payload = await authenticate(request, env);
+  if (!payload || payload.account !== "tech" || payload.tech_id == null) return null;
+  const row = await env.DB.prepare(`SELECT token_version, is_active, name FROM crm_techs WHERE st_tech_id = ?`).bind(payload.tech_id).first();
+  if (!row || row.is_active !== 1) return null;                       // deactivated → token dead
+  if ((row.token_version || 1) !== (payload.tv || 1)) return null;    // revoked (version bumped)
+  let refresh = false, fresh = null;
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.iat && now - payload.iat > TECH_REFRESH_AFTER && env.TS_JWT_SECRET) {
+    fresh = await signJWT({ account: "tech", tech_id: payload.tech_id, name: row.name, tv: row.token_version || 1 }, env.TS_JWT_SECRET, TECH_TOKEN_TTL);
+    refresh = true;
+  }
+  return { payload, refresh, fresh };
+}
+
+const clientIp = (request) => request.headers.get("CF-Connecting-IP") || "unknown";
+
+// Light global throttle: rolling 60s window per IP, max 30 login attempts.
+// true = allowed, false = over the limit.
+async function ipAllow(env, ip) {
+  const nowIso = new Date().toISOString();
+  const row = await env.DB.prepare(`SELECT count, window_start FROM ts_login_attempts WHERE ip = ?`).bind(ip).first();
+  const within = row && row.window_start && (Date.now() - Date.parse(row.window_start)) < IP_WINDOW_SEC * 1000;
+  if (!within) { await env.DB.prepare(`INSERT INTO ts_login_attempts (ip,count,window_start) VALUES (?,1,?) ON CONFLICT(ip) DO UPDATE SET count=1, window_start=excluded.window_start`).bind(ip, nowIso).run(); return true; }
+  if ((row.count || 0) >= IP_MAX_ATTEMPTS) return false;
+  await env.DB.prepare(`UPDATE ts_login_attempts SET count = count + 1 WHERE ip = ?`).bind(ip).run();
+  return true;
+}
+
+// Office-token gate for the admin (Techs & PINs) endpoints. The office app attaches
+// its Bearer on every call, so this is safe in T1 and doesn't strand techs.
+async function officeAuth(request, env) {
+  const payload = await authenticate(request, env);
+  return payload && payload.account === "office" ? payload : null;
+}
 
 // Shared shop(loc 1) -> van transfer. ONE atomic batch: van on_hand += qty +
 // transfer_in, shop on_hand -= qty + transfer_out. PURE inventory — no purchase,
@@ -197,6 +244,10 @@ async function saveLocationStock(env, locationId, items, operator, note) {
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { headers: cors() });
+    // Verify the tech token ONCE per request (account:'tech', token_version, active).
+    // null in T1 when a tech hasn't logged in yet — writes then fall back to b.tech_id.
+    const techTok = await techAuth(request, env);
+    const run = async () => {
     const url = new URL(request.url);
     const p = url.pathname;
 
@@ -222,7 +273,96 @@ export default {
       if (p === "/api/whoami" && request.method === "GET") {
         const payload = await authenticate(request, env);
         if (!payload) return json({ error: "unauthenticated" }, 401);
-        return json({ ok: true, account: payload.account, typ: payload.typ });
+        return json({ ok: true, account: payload.account, typ: payload.typ, tech_id: payload.tech_id ?? null });
+      }
+
+      // ── Phase 2 tech auth (T1 — live, but tech-write enforcement is OFF) ──
+
+      // GET /api/auth/tech-list -> active techs WITH a PIN set (the name picker).
+      if (p === "/api/auth/tech-list" && request.method === "GET") {
+        const r = await env.DB.prepare(
+          `SELECT st_tech_id, name FROM crm_techs
+            WHERE is_active = 1 AND pin_hash IS NOT NULL AND st_tech_id IS NOT NULL ORDER BY name`
+        ).all();
+        return json({ techs: r.results || [] });
+      }
+
+      // POST /api/auth/tech-login { tech_id, pin } -> { token } (account:'tech', 30d).
+      // Per-tech lockout (5 fails -> 15 min) + light global IP throttle.
+      if (p === "/api/auth/tech-login" && request.method === "POST") {
+        if (!env.TS_JWT_SECRET) return json({ error: "auth_not_configured" }, 503);
+        if (!(await ipAllow(env, clientIp(request)))) return json({ error: "too_many_attempts", retry_after_sec: IP_WINDOW_SEC }, 429);
+        const b = await request.json().catch(() => ({}));
+        const techId = parseInt(b.tech_id, 10);
+        const pin = String(b.pin || "");
+        if (!Number.isFinite(techId) || !/^\d{4}$/.test(pin)) return json({ error: "tech_id and 4-digit pin required" }, 400);
+        const row = await env.DB.prepare(
+          `SELECT st_tech_id, name, pin_hash, is_active, token_version, pin_fail_count, pin_locked_until FROM crm_techs WHERE st_tech_id = ?`
+        ).bind(techId).first();
+        if (!row || row.is_active !== 1 || !row.pin_hash) return json({ error: "invalid_credentials" }, 401);
+        if (row.pin_locked_until && Date.parse(row.pin_locked_until) > Date.now()) return json({ error: "locked", locked_until: row.pin_locked_until }, 423);
+        if (!(await verifyPassword(pin, row.pin_hash))) {
+          const fails = (row.pin_fail_count || 0) + 1;
+          const lockTo = fails >= PIN_MAX_FAILS ? new Date(Date.now() + PIN_LOCK_MINUTES * 60000).toISOString() : null;
+          await env.DB.prepare(`UPDATE crm_techs SET pin_fail_count = ?, pin_locked_until = ? WHERE st_tech_id = ?`).bind(lockTo ? 0 : fails, lockTo, techId).run();
+          return json(lockTo ? { error: "locked", locked_until: lockTo } : { error: "invalid_credentials", attempts_left: PIN_MAX_FAILS - fails }, lockTo ? 423 : 401);
+        }
+        await env.DB.prepare(`UPDATE crm_techs SET pin_fail_count = 0, pin_locked_until = NULL WHERE st_tech_id = ?`).bind(techId).run();
+        const token = await signJWT({ account: "tech", tech_id: techId, name: row.name, tv: row.token_version || 1 }, env.TS_JWT_SECRET, TECH_TOKEN_TTL);
+        return json({ ok: true, token, tech: { st_tech_id: techId, name: row.name } });
+      }
+
+      // GET /api/auth/tech-refresh -> fresh 30d token (tech app calls on open).
+      if (p === "/api/auth/tech-refresh" && request.method === "GET") {
+        if (!techTok) return json({ error: "unauthenticated" }, 401);
+        const token = await signJWT({ account: "tech", tech_id: techTok.payload.tech_id, name: techTok.payload.name, tv: techTok.payload.tv }, env.TS_JWT_SECRET, TECH_TOKEN_TTL);
+        return json({ ok: true, token });
+      }
+
+      // ── Office "Techs & PINs" admin (office token required) ──
+      if (p === "/api/admin/techs" && request.method === "GET") {
+        if (!(await officeAuth(request, env))) return json({ error: "office_auth_required" }, 401);
+        const r = await env.DB.prepare(
+          `SELECT st_tech_id, name, is_active, (pin_hash IS NOT NULL) AS has_pin, pin_set_at, pin_locked_until, token_version
+             FROM crm_techs WHERE st_tech_id IS NOT NULL ORDER BY is_active DESC, name`
+        ).all();
+        const now = Date.now();
+        return json({ techs: (r.results || []).map((t) => ({ ...t, locked: !!(t.pin_locked_until && Date.parse(t.pin_locked_until) > now) })) });
+      }
+
+      const adminPin = p.match(/^\/api\/admin\/techs\/(\d+)\/pin$/);
+      if (adminPin && request.method === "POST") {
+        if (!(await officeAuth(request, env))) return json({ error: "office_auth_required" }, 401);
+        const techId = parseInt(adminPin[1], 10);
+        const b = await request.json().catch(() => ({}));
+        const pin = String(b.pin || "");
+        if (!/^\d{4}$/.test(pin)) return json({ error: "pin must be 4 digits" }, 400);
+        const row = await env.DB.prepare(`SELECT st_tech_id FROM crm_techs WHERE st_tech_id = ?`).bind(techId).first();
+        if (!row) return json({ error: "tech_not_found" }, 404);
+        const hash = await hashPassword(pin);
+        // Setting/resetting a PIN clears any lockout + fail count.
+        await env.DB.prepare(`UPDATE crm_techs SET pin_hash = ?, pin_set_at = datetime('now'), pin_fail_count = 0, pin_locked_until = NULL WHERE st_tech_id = ?`).bind(hash, techId).run();
+        return json({ ok: true, st_tech_id: techId });
+      }
+
+      const adminActive = p.match(/^\/api\/admin\/techs\/(\d+)\/active$/);
+      if (adminActive && request.method === "POST") {
+        if (!(await officeAuth(request, env))) return json({ error: "office_auth_required" }, 401);
+        const techId = parseInt(adminActive[1], 10);
+        const b = await request.json().catch(() => ({}));
+        const active = b.active ? 1 : 0;
+        await env.DB.prepare(`UPDATE crm_techs SET is_active = ? WHERE st_tech_id = ?`).bind(active, techId).run();
+        return json({ ok: true, st_tech_id: techId, is_active: active });
+      }
+
+      const adminRevoke = p.match(/^\/api\/admin\/techs\/(\d+)\/revoke$/);
+      if (adminRevoke && request.method === "POST") {
+        if (!(await officeAuth(request, env))) return json({ error: "office_auth_required" }, 401);
+        const techId = parseInt(adminRevoke[1], 10);
+        // Bump token_version -> every existing device token for this tech fails next request.
+        await env.DB.prepare(`UPDATE crm_techs SET token_version = token_version + 1 WHERE st_tech_id = ?`).bind(techId).run();
+        const row = await env.DB.prepare(`SELECT token_version FROM crm_techs WHERE st_tech_id = ?`).bind(techId).first();
+        return json({ ok: true, st_tech_id: techId, token_version: row?.token_version });
       }
 
       // --- 0a. Tech roster for the name picker ----------------------------
@@ -388,6 +528,7 @@ export default {
       // change. truck_location_id resolved from the tech's van.
       if (p === "/api/requests" && request.method === "POST") {
         const b = await request.json().catch(() => ({}));
+        if (techTok) b.tech_id = techTok.payload.tech_id;   // T1: server-stamp actor from token; falls back to client body
         const description = (b.description || "").trim();
         if (b.tech_id == null) return json({ error: "tech_id required" }, 400);
         if (!description) return json({ error: "description required" }, 400);
@@ -441,6 +582,7 @@ export default {
       if (saveMatch && request.method === "POST") {
         const jobId = saveMatch[1];
         const b = await request.json();
+        if (techTok) b.tech_id = techTok.payload.tech_id;   // T1: server-stamp actor from token; falls back to client body
         if (!b.material_id || !b.quantity) {
           return json({ error: "material_id and quantity are required" }, 400);
         }
@@ -931,6 +1073,7 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
       if (purchMatch && request.method === "POST") {
         const jobId = purchMatch[1];
         const b = await request.json().catch(() => ({}));
+        if (techTok) b.tech_id = techTok.payload.tech_id;   // T1: server-stamp actor from token; falls back to client body
         const supplier = (b.supplier || "").trim();
         const total = Number(b.total);
         if (!supplier) return json({ error: "supplier required" }, 400);
@@ -1091,6 +1234,7 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
       // ZERO inventory.
       if (p === "/api/overhead/purchases" && request.method === "POST") {
         const b = await request.json().catch(() => ({}));
+        if (techTok) b.tech_id = techTok.payload.tech_id;   // T1: server-stamp actor from token; falls back to client body
         const supplier = (b.supplier || "").trim();
         const total = Number(b.total);
         if (!supplier) return json({ error: "supplier required" }, 400);
@@ -1454,6 +1598,7 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
       // the van row; material the shop doesn't track -> result "shop_untracked".
       if (p === "/api/restock/from-shop" && request.method === "POST") {
         const body = await request.json().catch(() => ({}));
+        if (techTok) { body.st_tech_id = techTok.payload.tech_id; body.created_by = techTok.payload.tech_id; }   // T1: server-stamp actor from token
         const stTechId = body.st_tech_id;
         const items = Array.isArray(body.items) ? body.items : null;
         if (stTechId == null) return json({ error: "st_tech_id required" }, 400);
@@ -1999,5 +2144,13 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
     } catch (e) {
       return json({ error: String(e.message || e) }, 500);
     }
+    };  // end run()
+
+    let resp = await run();
+    if (techTok && techTok.refresh && techTok.fresh) {   // refresh-on-use
+      resp = new Response(resp.body, resp);
+      resp.headers.set("X-TS-Token", techTok.fresh);
+    }
+    return resp;
   },
 };

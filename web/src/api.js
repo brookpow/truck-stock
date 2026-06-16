@@ -1,6 +1,57 @@
 // All calls to the truck-stock worker. One place to change the base URL.
 const API = import.meta.env.VITE_API || "https://truck-stock-worker.tiny-truth-e86a.workers.dev";
 
+// ── Phase 2 tech auth (T1). The tech token is attached to every worker call via a
+// global fetch wrapper. Refresh-on-use: the worker may return X-TS-Token (a fresh
+// 30d token) which we swap in. On 401/423 we drop the token so the app bounces to
+// login. In T1 nothing is enforced server-side, so an un-logged-in device still
+// works (writes fall back to the client tech_id) — this just layers identity on. ──
+const TOKEN_KEY = "ts_tech_token";
+export const getTechToken = () => localStorage.getItem(TOKEN_KEY);
+export const setTechToken = (t) => (t ? localStorage.setItem(TOKEN_KEY, t) : localStorage.removeItem(TOKEN_KEY));
+let onAuthLost = null;
+export const setOnAuthLost = (fn) => (onAuthLost = fn);
+
+const _fetch = window.fetch.bind(window);
+window.fetch = async (url, opts = {}) => {
+  const isApi = typeof url === "string" && url.startsWith(API);
+  const isLogin = isApi && (url.endsWith("/api/auth/tech-login") || url.endsWith("/api/auth/tech-list"));
+  const tok = getTechToken();
+  if (isApi && tok && !isLogin) opts = { ...opts, headers: { ...(opts.headers || {}), Authorization: "Bearer " + tok } };
+  const res = await _fetch(url, opts);
+  if (isApi) {
+    const fresh = res.headers.get("X-TS-Token");
+    if (fresh) setTechToken(fresh);                       // refresh-on-use
+    if ((res.status === 401 || res.status === 423) && tok && !isLogin) { setTechToken(null); if (onAuthLost) onAuthLost(res.status); }
+  }
+  return res;
+};
+
+// Active techs WITH a PIN set (the name picker).
+export async function techList() {
+  const r = await fetch(`${API}/api/auth/tech-list`);
+  if (!r.ok) throw new Error("tech-list " + r.status);
+  return r.json(); // { techs: [{st_tech_id, name}] }
+}
+
+// PIN login -> stores the token, returns the tech. Throws with a friendly message
+// on bad PIN (attempts_left) / lockout (423) / throttle (429).
+export async function techLogin(techId, pin) {
+  const r = await fetch(`${API}/api/auth/tech-login`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tech_id: techId, pin }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.token) {
+    if (r.status === 423) throw new Error("Too many wrong PINs — locked for a few minutes. Ask the office to reset it.");
+    if (r.status === 429) throw new Error("Too many attempts right now — wait a minute and try again.");
+    if (d.attempts_left != null) throw new Error(`Wrong PIN — ${d.attempts_left} tr${d.attempts_left === 1 ? "y" : "ies"} left.`);
+    throw new Error(d.error || ("login " + r.status));
+  }
+  setTechToken(d.token);
+  return d.tech; // { st_tech_id, name }
+}
+
 export async function getTechs() {
   const r = await fetch(`${API}/api/techs`);
   if (!r.ok) throw new Error("techs " + r.status);

@@ -8,6 +8,15 @@ function b64Decode(str) { const bin = atob(str); const buf = new Uint8Array(bin.
 function b64UrlEncode(str) { return btoa(str).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 function b64UrlDecode(str) { str = str.replace(/-/g, "+").replace(/_/g, "/"); while (str.length % 4) str += "="; return atob(str); }
 
+// PBKDF2-SHA256, 16-byte random salt, 100k iterations -> base64(salt):base64(hash).
+// Same format verifyPassword() reads. Used to set tech PINs (and any TS password).
+export async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const km = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" }, km, 256);
+  return `${b64Encode(salt)}:${b64Encode(bits)}`;
+}
+
 // PBKDF2-SHA256, 16-byte salt, 100k iterations -> base64(salt):base64(hash).
 export async function verifyPassword(password, storedHash) {
   const [saltB64, hashB64] = (storedHash || "").split(":");

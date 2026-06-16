@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
   scanReceipt, savePurchase, saveOverheadPurchase, restockFromShop, getJobPurchases, deletePurchase, patchPurchase,
-  getByCategory, createRequest, receiptPhotoUrl } from "./api";
+  getByCategory, createRequest, receiptPhotoUrl,
+  techList, techLogin, getTechToken, setTechToken, setOnAuthLost } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 import { C, FONT, DISP, SHADOW, BADGE } from "./theme.js";
 
@@ -17,12 +18,18 @@ const STORE_KEY = "ts_tech"; // remembers the logged-in tech on this device
 export default function App() {
   const [tech, setTech] = useState(null);
 
-  // Restore "logged in" tech from this device.
+  // Restore "logged in" tech from this device. We trust the saved tech object for
+  // instant UI, but the token (held in api.js) is what authorizes writes; if the
+  // worker rejects it (401/423 — revoked/expired/locked), api.js fires onAuthLost
+  // and we bounce back to the login screen.
   useEffect(() => {
     const saved = localStorage.getItem(STORE_KEY);
-    if (saved) {
+    if (saved && getTechToken()) {
       try { setTech(JSON.parse(saved)); } catch {}
+    } else if (saved && !getTechToken()) {
+      localStorage.removeItem(STORE_KEY);                 // token gone → require fresh login
     }
+    setOnAuthLost(() => { localStorage.removeItem(STORE_KEY); setTech(null); });
   }, []);
 
   // Start the offline-save auto-flush once for the whole app. When the queue
@@ -35,38 +42,76 @@ export default function App() {
   }, []);
 
   function chooseTech(t) {
-    localStorage.setItem(STORE_KEY, JSON.stringify(t));
-    setTech(t);
+    // techLogin() already stored the token; remember the tech on this device.
+    const obj = { st_tech_id: t.st_tech_id, name: t.name };
+    localStorage.setItem(STORE_KEY, JSON.stringify(obj));
+    setTech(obj);
   }
   function signOut() {
     localStorage.removeItem(STORE_KEY);
+    setTechToken(null);
     setTech(null);
   }
 
-  if (!tech) return <PickTech onPick={chooseTech} />;
+  if (!tech) return <Login onLogin={chooseTech} />;
   return <Jobs tech={tech} onSignOut={signOut} />;
 }
 
-// ---- Screen 1: pick your name (one time per device) ----------------------
-function PickTech({ onPick }) {
+// ---- Screen 1: pick your name -> enter your 4-digit PIN ------------------
+function Login({ onLogin }) {
   const [techs, setTechs] = useState(null);
   const [err, setErr] = useState(null);
+  const [picked, setPicked] = useState(null);   // selected tech {st_tech_id, name}
+  const [pin, setPin] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  useEffect(() => {
-    getTechs().then(setTechs).catch((e) => setErr(String(e.message || e)));
-  }, []);
+  useEffect(() => { techList().then((d) => setTechs(d.techs || [])).catch((e) => setErr(String(e.message || e))); }, []);
 
+  async function submit(p) {
+    setBusy(true); setErr(null);
+    try { const tech = await techLogin(picked.st_tech_id, p); onLogin(tech); }
+    catch (e) { setErr(String(e.message || e)); setPin(""); setBusy(false); }
+  }
+  function press(d) {
+    if (busy) return;
+    const next = (pin + d).slice(0, 4);
+    setPin(next);
+    if (next.length === 4) submit(next);
+  }
+
+  // Name picker
+  if (!picked) {
+    return (
+      <div style={styles.screen}>
+        <h1 style={styles.h1}>Who are you?</h1>
+        <p style={styles.sub}>Tap your name, then enter your PIN.</p>
+        {err && <div style={styles.error}>{err}</div>}
+        {!techs && !err && <div style={styles.muted}>Loading…</div>}
+        {techs && techs.length === 0 && <div style={styles.muted}>No techs set up yet — ask the office to set your PIN.</div>}
+        {techs && techs.map((t) => (
+          <button key={t.st_tech_id} style={styles.bigRow} onClick={() => { setPicked(t); setErr(null); }}>{t.name}</button>
+        ))}
+      </div>
+    );
+  }
+  // PIN pad
   return (
     <div style={styles.screen}>
-      <h1 style={styles.h1}>Who are you?</h1>
-      <p style={styles.sub}>Tap your name. This device will remember you.</p>
-      {err && <div style={styles.error}>Couldn't load techs: {err}</div>}
-      {!techs && !err && <div style={styles.muted}>Loading…</div>}
-      {techs && techs.map((t) => (
-        <button key={t.id} style={styles.bigRow} onClick={() => onPick(t)}>
-          {t.name}
-        </button>
-      ))}
+      <h1 style={styles.h1}>Hi {picked.name.split(" ")[0]}</h1>
+      <p style={styles.sub}>Enter your 4-digit PIN.</p>
+      <div style={styles.pinDots}>
+        {[0, 1, 2, 3].map((i) => <span key={i} style={{ ...styles.pinDot, ...(pin.length > i ? styles.pinDotOn : {}) }} />)}
+      </div>
+      {err && <div style={styles.error}>{err}</div>}
+      <div style={styles.pinPad}>
+        {["1","2","3","4","5","6","7","8","9"].map((d) => (
+          <button key={d} style={styles.pinKey} disabled={busy} onClick={() => press(d)}>{d}</button>
+        ))}
+        <button style={styles.pinKeyGhost} disabled={busy} onClick={() => { setPicked(null); setPin(""); setErr(null); }}>back</button>
+        <button style={styles.pinKey} disabled={busy} onClick={() => press("0")}>0</button>
+        <button style={styles.pinKeyGhost} disabled={busy} onClick={() => setPin(pin.slice(0, -1))}>⌫</button>
+      </div>
+      {busy && <div style={styles.muted}>Checking…</div>}
     </div>
   );
 }
@@ -1060,6 +1105,12 @@ const styles = {
   who: { fontSize: 14, fontWeight: 600, color: C.ink2 },
   linkBtn: { background: "none", border: "none", color: C.blue, fontSize: 14, padding: 6, cursor: "pointer", fontWeight: 600 },
   bigRow: { ...card, display: "block", width: "100%", textAlign: "left", padding: "18px", fontFamily: DISP, fontSize: 18, fontWeight: 700, letterSpacing: "-.02em", color: C.ink, marginBottom: 10, borderRadius: 16, cursor: "pointer" },
+  pinDots: { display: "flex", gap: 16, justifyContent: "center", margin: "18px 0 14px" },
+  pinDot: { width: 16, height: 16, borderRadius: 999, background: C.sunk, border: `2px solid ${C.hair}`, boxSizing: "border-box" },
+  pinDotOn: { background: C.blue, border: `2px solid ${C.blue}` },
+  pinPad: { display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, maxWidth: 320, margin: "8px auto 0" },
+  pinKey: { padding: "18px 0", fontFamily: DISP, fontSize: 26, fontWeight: 700, color: C.ink, background: C.surface, border: `1px solid ${C.hair}`, borderRadius: 16, cursor: "pointer", boxShadow: SHADOW.e1 },
+  pinKeyGhost: { padding: "18px 0", fontSize: 15, fontWeight: 600, color: C.ink3, background: "none", border: "none", cursor: "pointer" },
   jobRow: { ...card, display: "block", width: "100%", textAlign: "left", padding: "15px 16px", marginBottom: 11, borderRadius: 18, cursor: "pointer" },
   jobRowTop: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 },
   jobCust: { fontFamily: DISP, fontWeight: 700, fontSize: 17, letterSpacing: "-.02em", flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: C.ink },

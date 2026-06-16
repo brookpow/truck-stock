@@ -912,7 +912,10 @@ export default {
         });
       }
 
-      // --- 4c. AI receipt / packing-slip scan (READ-ONLY — logs nothing) -
+      // --- 4c. AI receipt / packing-slip scan (wholesaler + retail) ------
+      // Returns parsed data for the tech to review; writes NOTHING to the job.
+      // Phase 1: logs each scan to ts_scan_log (diagnostics) — best-effort, never
+      // alters the response.
       // POST /api/jobs/:jobId/scan-receipt   Body: { image_base64, media_type }
       // Ported from CRM_BUILD inventory.js: Claude vision extracts supplier +
       // line items + totals; we fuzzy-match each line to the catalog and return
@@ -928,25 +931,48 @@ export default {
         const b = await request.json().catch(() => ({}));
         if (!b.image_base64) return json({ error: "missing_image" }, 400);
         const mediaType = b.media_type || "image/jpeg";
+        const VISION_MODEL = "claude-sonnet-4-6";   // claude-sonnet-4-20250514 now 404s (retired) — current Sonnet
 
-        const prompt = `You are reading a plumbing wholesaler receipt or packing slip (EMCO, Sheret, Wolseley, or similar). The image may be rotated. Return JSON ONLY — no markdown fences, no prose.
+        // Phase 1 diagnostics (best-effort; NEVER alters the scan response): store
+        // the image we sent + log each scan outcome so we can see the real failure
+        // mix (truncated / parse_failed / wrong values / network) before Phase 2.
+        const scanId = crypto.randomUUID();
+        const imgBytes = Math.round((b.image_base64.length * 3) / 4);
+        let imageKey = null;
+        if (env.RECEIPTS) {
+          try {
+            imageKey = `scan-log/${scanId}.jpg`;
+            await env.RECEIPTS.put(imageKey, Uint8Array.from(atob(b.image_base64), (c) => c.charCodeAt(0)), { httpMetadata: { contentType: mediaType } });
+          } catch (_) { imageKey = null; }
+        }
+        const logScan = async (outcome, x = {}) => {
+          try {
+            await env.DB.prepare(`INSERT INTO ts_scan_log (job_id, tech_id, outcome, http_status, stop_reason, model, source_type, supplier, item_count, raw_len, raw_output, image_key, image_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+              .bind(scanMatch[1], techTok?.payload?.tech_id ?? null, outcome, x.status ?? null, x.stop_reason ?? null, VISION_MODEL,
+                    x.source_type ?? null, x.supplier ?? null, x.item_count ?? null, x.raw_len ?? null,
+                    x.raw != null ? String(x.raw).slice(0, 12000) : null, imageKey, imgBytes).run();
+          } catch (_) {}
+        };
 
-MONEY FORMAT — IMPORTANT: some slips (e.g. Wolseley) print money as whole numbers with NO decimal point, where the last two digits are cents: "13106" = 131.06, "2694" = 26.94, "585" = 5.85, "819" = 8.19. If a money value has no decimal point, divide by 100. If it already has a decimal point, read it exactly as printed.
+        const prompt = `You are reading a supplier receipt or packing slip from a plumbing job. It may be from a plumbing WHOLESALER (EMCO, Wolseley, Sheret, and similar) OR a RETAIL store (Home Depot, Lowe's, Canadian Tire, Rona, Costco, and similar). The image may be rotated. Return JSON ONLY — no markdown fences, no prose.
+
+MONEY FORMAT: Read every money value EXACTLY as printed, including its decimal point. ONLY if the slip prints money with NO decimal points ANYWHERE — a quirk of some wholesaler slips like Wolseley ("13106" = 131.06, "2694" = 26.94, "585" = 5.85) — treat the last two digits as cents and divide by 100. Retail receipts (Home Depot, Lowe's, Canadian Tire, etc.) always print normal decimals — NEVER divide those by 100.
 
 Extract:
-- "supplier": the wholesaler/company name (e.g. "EMCO", "Sheret", "Wolseley"), or "" if unclear.
+- "source_type": "wholesaler" if it's a plumbing-supply house (EMCO / Wolseley / Sheret / etc.), "retail" if it's a retail or big-box store (Home Depot / Lowe's / Canadian Tire / Rona / Costco / etc.), or "unknown".
+- "supplier": the store/company name as printed (e.g. "EMCO", "Wolseley", "The Home Depot", "Canadian Tire"), or "" if unclear.
 - "items": EVERY line item, each with:
-   · "description": the item name as printed (omit leading column codes/line numbers).
-   · "quantity": the shipped/ordered quantity (a number).
-   · "unit_price": the per-unit price column.
-   · "line_total": the printed EXTENDED amount for that row — the column headed "EXTENSION", "Line amt", "Amount", or similar. This is the row's authoritative total (it already accounts for per-100/per-foot pricing). If the slip has no extended column, use 0.
-- "tax_shown": true if the slip prints a GST / PST / HST tax line OR a clearly tax-included grand total; false if it's a packing slip with no tax (no GST/PST lines; total blank or 0.00).
+   · "description": the item name as printed (omit leading column codes / line numbers / SKUs).
+   · "quantity": the quantity bought (a number; default 1).
+   · "unit_price": the per-unit price.
+   · "line_total": the printed EXTENDED/line amount for that row — the column headed "EXTENSION", "Line amt", "Amount", "Total", or similar (common on wholesaler slips; it already accounts for per-100/per-foot pricing). If there is no such column (typical on retail receipts), use 0.
+- "tax_shown": true if the receipt prints a GST / PST / HST / TAX line OR a clearly tax-included grand total; false ONLY if there is no tax anywhere (e.g. a wholesaler packing slip with a blank or 0.00 total).
 - "shown_subtotal": the printed pre-tax subtotal, else 0.
-- "shown_tax": GST + PST (+ HST) added together, else 0.
-- "shown_total": the printed grand TOTAL line. IGNORE a 0.00 or blank total (a packing slip with no total) — use 0 then.
+- "shown_tax": GST + PST (+ HST / TAX) added together, else 0.
+- "shown_total": the printed grand TOTAL line. IGNORE a 0.00 or blank total — use 0 then.
 
 Use 0 for any number not visible. Do not hallucinate.
-Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"line_total":0}],"tax_shown":false,"shown_subtotal":0,"shown_tax":0,"shown_total":0}`;
+Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"line_total":0}],"tax_shown":false,"shown_subtotal":0,"shown_tax":0,"shown_total":0}`;
 
         const callVision = () => fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
@@ -956,8 +982,9 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
             "anthropic-version": "2023-06-01",
           },
           body: JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 1500,
+            model: VISION_MODEL,
+            max_tokens: 4096,        // long retail receipts + multi-line POs overflowed 1500 → truncated JSON
+            temperature: 0,          // deterministic structured extraction
             messages: [{
               role: "user",
               content: [
@@ -977,6 +1004,7 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
             aiResp = await callVision();
           }
         } catch (e) {
+          await logScan("network", { raw: String(e?.message || e), raw_len: 0 });
           return json({ error: "anthropic_network", message: String(e?.message || e) }, 502);
         }
         if (!aiResp.ok) {
@@ -984,10 +1012,12 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
           // retryable flag lets the client distinguish "busy, try again" (529/5xx)
           // from a hard failure. The tech UI shows a friendly message either way.
           const retryable = aiResp.status === 529 || aiResp.status >= 500;
+          await logScan("vision_unavailable", { status: aiResp.status, raw: errText, raw_len: errText.length });
           return json({ error: "vision_unavailable", status: aiResp.status, retryable, message: errText.slice(0, 300) }, 502);
         }
         const data = await aiResp.json().catch(() => null);
         const text = data?.content?.[0]?.text || "";
+        const stopReason = data?.stop_reason || null;   // 'max_tokens' => truncated output
 
         // Claude occasionally wraps in ```json fences even when told not to.
         let parsed = null;
@@ -998,7 +1028,10 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
           const m = text.match(/\{[\s\S]*\}/);
           if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
         }
-        if (!parsed) return json({ error: "parse_failed", raw: text.slice(0, 500) }, 502);
+        if (!parsed) {
+          await logScan("parse_failed", { status: aiResp.status, stop_reason: stopReason, raw: text, raw_len: text.length });
+          return json({ error: "parse_failed", raw: text.slice(0, 500) }, 502);
+        }
 
         // Compute each line total = qty × unit_price (NEVER read the line total
         // off the slip — that was the EMCO bug, grabbing unit price as the total).
@@ -1027,17 +1060,21 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
           it.match = m ? { id: m.id, name: m.name, code: m.code, emco_sku: m.emco_sku, cost: m.cost } : null;
         }
 
-        // Subtotal / tax / total by wholesaler type:
-        //  · tax ALREADY on the slip (e.g. Wolseley GST/PST or tax-included total)
-        //    -> trust the printed grand total; do NOT add another 12%.
-        //  · NO tax shown (EMCO/Sheret packing slips, 0.00 totals) -> sum the
-        //    line totals and apply 12% (PST+GST).
+        // Subtotal / tax / total — routes by what's printed (works for BOTH
+        // wholesaler and retail; the math is unchanged from the verified version):
+        //  · tax ALREADY on the slip (retail receipt, or Wolseley GST/PST, or a
+        //    tax-included total) -> trust the printed grand total; do NOT add 12%.
+        //  · NO tax + NO total (a wholesaler packing slip) -> sum the line totals
+        //    and apply 12% (PST+GST). A RETAIL receipt should never land here — if
+        //    it does, the total was misread, so we flag low_confidence (no silent
+        //    fabricated total).
+        const sourceType = parsed.source_type || "unknown";
         const lineSum = round2(items.reduce((a, it) => a + (it.total || 0), 0));
         const taxShown = parsed.tax_shown === true;
         const shownTotal = Number(parsed.shown_total) || 0;   // 0.00 → ignored
         const shownTax = Number(parsed.shown_tax) || 0;
         const shownSub = Number(parsed.shown_subtotal) || 0;
-        let subtotal, tax, total;
+        let subtotal, tax, total, low_confidence = false;
         if (taxShown && shownTotal > 0) {
           total = round2(shownTotal);
           subtotal = shownSub > 0 ? round2(shownSub)
@@ -1047,15 +1084,21 @@ Schema: {"supplier":"","items":[{"description":"","quantity":1,"unit_price":0,"l
           subtotal = lineSum;
           tax = round2(subtotal * 0.12);
           total = round2(subtotal * 1.12);
+          if (sourceType === "retail") low_confidence = true;  // retail always has a total → this is a misread
         }
+
+        await logScan(stopReason === "max_tokens" ? "success_truncated" : "success",
+          { status: aiResp.status, stop_reason: stopReason, source_type: sourceType, supplier: parsed.supplier || "", item_count: items.length, raw: text, raw_len: text.length });
 
         return json({
           ok: true,
           job_id: scanMatch[1],
+          source_type: sourceType,
           supplier: parsed.supplier || "",
           items,                                  // each: {description, quantity, unit_cost, total, match}
           subtotal, tax, total,
           tax_shown: taxShown,                    // true = tax already on the slip (not re-taxed)
+          low_confidence,                         // true = retail receipt with no readable total (double-check)
         });
       }
 

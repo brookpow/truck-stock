@@ -741,7 +741,7 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
 
 // Downscale a captured photo (phone cameras are huge) and return RAW base64 —
 // keeps the upload small/fast; the receipt text stays legible at ~1600px.
-function fileToScaledBase64(file, maxDim = 1600, quality = 0.85) {
+function fileToScaledBase64(file, maxDim = 1600, quality = 0.92) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error("couldn't read the photo"));

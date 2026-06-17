@@ -3,6 +3,13 @@ main = "src/index.js"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+# Receipt-scanner vision model. ONE PLACE to change when a model is retired:
+# edit this line, then `npx wrangler deploy`. The worker falls back to the same
+# default in code if this is unset. The office Home shows a red banner if scans
+# start failing at the API level (e.g. this model 404s), pointing right here.
+[vars]
+VISION_MODEL = "claude-sonnet-4-6"
+
 # Same shared database as AdTrack, CRM, and GP-tracker.
 # This app reads crm_materials (catalog) and writes crm_job_materials (usage).
 [[d1_databases]]

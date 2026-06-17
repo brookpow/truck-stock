@@ -127,20 +127,82 @@ async function pullShopToVan(env, vanId, mid, qty, operator, ref, opts = {}) {
   }
 
   const shopBefore = whRow.on_hand ?? 0;
+  const batchId = opts.batchId ?? null;   // groups every leg of one confirm action (for undo)
   await env.DB.batch([
     env.DB.prepare(`UPDATE crm_inventory_stock SET on_hand = ?, last_restocked = datetime('now'), modified_at = datetime('now') WHERE id = ?`)
       .bind((vanRow.on_hand ?? 0) + qty, vanRow.id),
-    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by) VALUES (?,?,?,?,?,?,?)`)
-      .bind(mid, vanId, qty, "transfer_in", ref, note, operator),
+    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id) VALUES (?,?,?,?,?,?,?,?)`)
+      .bind(mid, vanId, qty, "transfer_in", ref, note, operator, batchId),
     env.DB.prepare(`UPDATE crm_inventory_stock SET on_hand = ?, modified_at = datetime('now') WHERE id = ?`)
       .bind(shopBefore - qty, whRow.id),   // shop may go negative — recount/reorder signal
-    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by) VALUES (?,?,?,?,?,?,?)`)
-      .bind(mid, WAREHOUSE_ID, -qty, "transfer_out", ref, note, operator),
+    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id) VALUES (?,?,?,?,?,?,?,?)`)
+      .bind(mid, WAREHOUSE_ID, -qty, "transfer_out", ref, note, operator, batchId),
   ]);
 
   const out = { material_id: mid, result: "pulled_shop", quantity: qty };
   if (opts.reportShortfall && shopBefore < qty) out.shop_shortfall = qty - shopBefore;
   return out;
+}
+
+// Reverse ONE batch (a shop->van confirm/restock, or a PO-receive action) — or a
+// single line of it (materialId). Writes REVERSING ledger legs (never deletes),
+// restores on_hand, and for PO receive decrements qty_received + recomputes PO
+// status. Idempotent: undone_at blocks double-undo. Returns a summary + warnings
+// (e.g. on_hand went negative because stock was used/moved since the restock).
+async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {}) {
+  if (!batchId) return { ok: false, error: "batch_id required" };
+  const binds = materialId != null ? [batchId, materialId] : [batchId];
+  const legs = (await env.DB.prepare(
+    `SELECT id, material_id, location_id, qty_change, reason, reference_id
+       FROM crm_inventory_movements
+      WHERE batch_id = ? AND undone_at IS NULL
+        ${materialId != null ? "AND material_id = ?" : ""}`
+  ).bind(...binds).all()).results || [];
+  // Only reversible restock/receive legs (ignore anything else that shares the id).
+  const work = legs.filter((l) => ["transfer_in", "transfer_out", "po_receive"].includes(l.reason));
+  if (!work.length) return { ok: false, error: "nothing_to_undo", message: "already undone, or no such batch/line" };
+
+  const revBatch = `undo:${batchId}`;
+  const warnings = [], poIds = new Set(), stmts = [];
+  for (const leg of work) {
+    const reverseQty = -leg.qty_change;   // opposite sign restores stock
+    const srow = await env.DB.prepare(
+      `SELECT id, on_hand FROM crm_inventory_stock WHERE location_id=? AND material_id=?`
+    ).bind(leg.location_id, leg.material_id).first();
+    if (srow) {
+      const after = (srow.on_hand ?? 0) + reverseQty;
+      stmts.push(env.DB.prepare(`UPDATE crm_inventory_stock SET on_hand=?, modified_at=datetime('now') WHERE id=?`).bind(after, srow.id));
+      if (after < 0) warnings.push({ material_id: leg.material_id, location_id: leg.location_id, on_hand_after: after, note: "stock went negative — some was used or moved since this restock" });
+    }
+    const revReason = leg.reason === "transfer_in" ? "transfer_out"
+                    : leg.reason === "transfer_out" ? "transfer_in"
+                    : "manual";   // po_receive: CHECK has no po_unreceive
+    if (leg.reason === "po_receive") poIds.add(leg.reference_id);
+    stmts.push(env.DB.prepare(
+      `INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id)
+       VALUES (?,?,?,?,?,?,?,?)`
+    ).bind(leg.material_id, leg.location_id, reverseQty, revReason, leg.reference_id, `undo of batch ${batchId}`, operator, revBatch));
+    if (leg.reason === "po_receive") {
+      stmts.push(env.DB.prepare(
+        `UPDATE crm_inventory_po_items SET qty_received = MAX(0, COALESCE(qty_received,0) - ?) WHERE po_id=? AND material_id=?`
+      ).bind(leg.qty_change, leg.reference_id, leg.material_id));
+    }
+    stmts.push(env.DB.prepare(`UPDATE crm_inventory_movements SET undone_at=datetime('now') WHERE id=?`).bind(leg.id));
+  }
+  await env.DB.batch(stmts);
+
+  // Recompute status for any PO whose receive was reversed.
+  const po = [];
+  for (const poId of poIds) {
+    const lines = (await env.DB.prepare(`SELECT qty_ordered, qty_received FROM crm_inventory_po_items WHERE po_id=?`).bind(poId).all()).results || [];
+    const received = lines.reduce((a, l) => a + (l.qty_received ?? 0), 0);
+    const anyOut = lines.some((l) => (l.qty_received ?? 0) < l.qty_ordered);
+    const status = received <= 0 ? "Sent" : (anyOut ? "Partial" : "Received");
+    if (status === "Received") await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET status='Received', received_at=datetime('now') WHERE id=?`).bind(poId).run();
+    else await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET status=?, received_at=NULL WHERE id=?`).bind(status, poId).run();
+    po.push({ po_id: poId, status });
+  }
+  return { ok: true, batch_id: batchId, legs_reversed: work.length, reversing_batch: revBatch, warnings, po };
 }
 
 function pacificDayBoundsUTC(now = new Date()) {
@@ -363,6 +425,43 @@ export default {
         await env.DB.prepare(`UPDATE crm_techs SET token_version = token_version + 1 WHERE st_tech_id = ?`).bind(techId).run();
         const row = await env.DB.prepare(`SELECT token_version FROM crm_techs WHERE st_tech_id = ?`).bind(techId).first();
         return json({ ok: true, st_tech_id: techId, token_version: row?.token_version });
+      }
+
+      // ── Scanner health (office banner). SYSTEMIC = API-level breaks that are NOT
+      // photo-dependent: vision_unavailable with a hard/config status (404 model-
+      // not-found, 401/403 auth, 400) OR network. parse_failed (bad/illegible slip)
+      // and success_truncated (long receipt) contribute ZERO — a tech's crumpled
+      // photo can never trip the banner. Transient 5xx/429/529 self-heal → excluded.
+      if (p === "/api/admin/scan-health" && request.method === "GET") {
+        if (!(await officeAuth(request, env))) return json({ error: "office_auth_required" }, 401);
+        const HARD = "(outcome='network' OR (outcome='vision_unavailable' AND http_status IN (400,401,403,404)))";
+        const stats = await env.DB.prepare(
+          `SELECT COUNT(*) AS total,
+             SUM(CASE WHEN outcome IN ('success','success_truncated') THEN 1 ELSE 0 END) AS success,
+             SUM(CASE WHEN outcome='parse_failed' THEN 1 ELSE 0 END) AS parse_failed,
+             SUM(CASE WHEN ${HARD} THEN 1 ELSE 0 END) AS hard_api_fail,
+             SUM(CASE WHEN outcome='vision_unavailable' AND (http_status IS NULL OR http_status NOT IN (400,401,403,404)) THEN 1 ELSE 0 END) AS transient_fail
+           FROM ts_scan_log WHERE created_at >= datetime('now','-24 hours')`
+        ).first();
+        const hard = Number(stats?.hard_api_fail || 0);
+        const systemic = hard >= 2;        // ≥2 infra failures in 24h = reproducible break, not a fluke
+        let top_status = null, top_message = null, last_fail_at = null;
+        if (systemic) {
+          const r = await env.DB.prepare(
+            `SELECT http_status, outcome, raw_output, created_at FROM ts_scan_log
+              WHERE created_at >= datetime('now','-24 hours') AND ${HARD} ORDER BY id DESC LIMIT 1`
+          ).first();
+          top_status = r?.http_status ?? null;
+          top_message = String(r?.raw_output || r?.outcome || "").slice(0, 220);
+          last_fail_at = r?.created_at || null;
+        }
+        return json({
+          window_hours: 24, model: env.VISION_MODEL || "claude-sonnet-4-6",
+          total: Number(stats?.total || 0), success: Number(stats?.success || 0),
+          parse_failed: Number(stats?.parse_failed || 0), hard_api_fail: hard,
+          transient_fail: Number(stats?.transient_fail || 0),
+          systemic, top_status, top_message, last_fail_at,
+        });
       }
 
       // --- 0a. Tech roster for the name picker ----------------------------
@@ -931,7 +1030,7 @@ export default {
         const b = await request.json().catch(() => ({}));
         if (!b.image_base64) return json({ error: "missing_image" }, 400);
         const mediaType = b.media_type || "image/jpeg";
-        const VISION_MODEL = "claude-sonnet-4-6";   // claude-sonnet-4-20250514 now 404s (retired) — current Sonnet
+        const VISION_MODEL = env.VISION_MODEL || "claude-sonnet-4-6";   // configured in wrangler.toml [vars]; fallback here
 
         // Phase 1 diagnostics (best-effort; NEVER alters the scan response): store
         // the image we sent + log each scan outcome so we can see the real failure
@@ -1542,6 +1641,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         // pull and use its id as reference_id (true FK, reversible like CRM's
         // /transfers/:id/reverse) instead of this synthetic shared token.
         const refBase = Date.now() * 1000;
+        const batchId = crypto.randomUUID();   // one id for this whole confirm action (undo target)
 
         const results = [];
         for (let i = 0; i < items.length; i++) {
@@ -1557,7 +1657,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
               // Shared transfer engine (factored). Office keeps its behavior:
               // van/shop row required — a throw becomes a "failed" result below,
               // no auto-create, no shortfall field.
-              results.push(await pullShopToVan(env, locationId, mid, qty, operator, ref));
+              results.push(await pullShopToVan(env, locationId, mid, qty, operator, ref, { batchId }));
 
             } else if (action === "pull_other") {
               // Van += qty only. Shop UNTOUCHED — parts came from loose extras,
@@ -1577,9 +1677,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
                 ).bind((vanRow.on_hand ?? 0) + qty, vanRow.id),
                 env.DB.prepare(
                   `INSERT INTO crm_inventory_movements
-                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
-                   VALUES (?,?,?,?,?,?,?)`
-                ).bind(mid, locationId, qty, "transfer_in", ref, "restock pull (other source — not from shop)", operator),
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id)
+                   VALUES (?,?,?,?,?,?,?,?)`
+                ).bind(mid, locationId, qty, "transfer_in", ref, "restock pull (other source — not from shop)", operator, batchId),
               ]);
               results.push({ material_id: mid, result: "pulled_other", quantity: qty });
 
@@ -1629,7 +1729,62 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           ([material_id, oh]) => ({ material_id: Number(material_id), on_hand: oh })
         );
 
-        return json({ location_id: Number(locationId) || locationId, results, on_hand });
+        return json({ location_id: Number(locationId) || locationId, batch_id: batchId, results, on_hand });
+      }
+
+      // --- Restock/receive UNDO (batch-scoped, auditable) ----------------
+      // GET /api/restock/:loc/batches — recent confirm batches that stocked THIS van
+      // (newest first), each with its lines + undone flag, for the undo UI.
+      const batchesMatch = p.match(/^\/api\/restock\/([^/]+)\/batches$/);
+      if (batchesMatch && request.method === "GET") {
+        const locId = Number(batchesMatch[1]);
+        const rows = (await env.DB.prepare(
+          `SELECT m.batch_id, m.material_id, m.qty_change, m.created_at, m.created_by, m.undone_at, mat.name AS material
+             FROM crm_inventory_movements m LEFT JOIN crm_materials mat ON mat.id = m.material_id
+            WHERE m.location_id = ? AND m.reason = 'transfer_in'
+              AND m.batch_id IS NOT NULL AND m.batch_id NOT LIKE 'undo:%'
+            ORDER BY m.created_at DESC, m.id DESC`
+        ).bind(locId).all()).results || [];
+        const byBatch = new Map();
+        for (const r of rows) {
+          let b = byBatch.get(r.batch_id);
+          if (!b) { b = { batch_id: r.batch_id, created_at: r.created_at, created_by: r.created_by, lines: [] }; byBatch.set(r.batch_id, b); }
+          b.lines.push({ material_id: r.material_id, material: r.material, qty: r.qty_change, undone: !!r.undone_at });
+        }
+        const batches = [...byBatch.values()].map((b) => ({ ...b, undone: b.lines.every((l) => l.undone) })).slice(0, 25);
+        return json({ location_id: locId, batches });
+      }
+
+      // GET /api/reorder/po/:id/receipts — receive events (batches) for one PO.
+      const poReceiptsMatch = p.match(/^\/api\/reorder\/po\/(\d+)\/receipts$/);
+      if (poReceiptsMatch && request.method === "GET") {
+        const poId = Number(poReceiptsMatch[1]);
+        const rows = (await env.DB.prepare(
+          `SELECT m.batch_id, m.material_id, m.qty_change, m.created_at, m.created_by, m.undone_at, mat.name AS material
+             FROM crm_inventory_movements m LEFT JOIN crm_materials mat ON mat.id = m.material_id
+            WHERE m.reason = 'po_receive' AND m.reference_id = ?
+              AND m.batch_id IS NOT NULL AND m.batch_id NOT LIKE 'undo:%'
+            ORDER BY m.created_at DESC, m.id DESC`
+        ).bind(poId).all()).results || [];
+        const byBatch = new Map();
+        for (const r of rows) {
+          let b = byBatch.get(r.batch_id);
+          if (!b) { b = { batch_id: r.batch_id, created_at: r.created_at, created_by: r.created_by, lines: [] }; byBatch.set(r.batch_id, b); }
+          b.lines.push({ material_id: r.material_id, material: r.material, qty: r.qty_change, undone: !!r.undone_at });
+        }
+        const receipts = [...byBatch.values()].map((b) => ({ ...b, undone: b.lines.every((l) => l.undone) }));
+        return json({ po_id: poId, receipts });
+      }
+
+      // POST /api/inventory/batch/:batchId/undo  body { material_id?, created_by? }
+      // Whole-batch undo, or one line (material_id). Reverses inventory + writes
+      // reversing ledger legs. Idempotent (undone_at blocks a second undo).
+      const undoMatch = p.match(/^\/api\/inventory\/batch\/([^/]+)\/undo$/);
+      if (undoMatch && request.method === "POST") {
+        const batchId = decodeURIComponent(undoMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const res = await undoBatch(env, batchId, { materialId: body.material_id ?? null, operator: body.created_by ?? 8 });
+        return json(res, res.ok ? 200 : 409);
       }
 
       // --- 5c. Tech-initiated restock FROM SHOP (no job, no purchase) -----
@@ -1654,18 +1809,19 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
 
         const operator = body.created_by ?? 8;   // crm_users.id — movement created_by
         const refBase = Date.now() * 1000;
+        const batchId = crypto.randomUUID();      // one id for this from-shop action (undo target)
         const results = [];
         for (let i = 0; i < items.length; i++) {
           const it = items[i] || {};
           const qty = Number(it.quantity ?? it.qty) || 0;
           try {
             results.push(await pullShopToVan(env, van.id, it.material_id, qty, operator, refBase + i,
-              { autoCreateVan: true, reportShortfall: true, note: `tech restock from shop (tech ${stTechId})` }));
+              { autoCreateVan: true, reportShortfall: true, batchId, note: `tech restock from shop (tech ${stTechId})` }));
           } catch (e) {
             results.push({ material_id: it.material_id, result: "failed", error: String(e.message || e) });
           }
         }
-        return json({ van_id: van.id, van_name: van.name, results });
+        return json({ van_id: van.id, van_name: van.name, batch_id: batchId, results });
       }
 
       // --- 6a. Shop (warehouse) stock — full dump for count/levels views --
@@ -2066,6 +2222,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           return json({ error: `PO is ${po.status}; only Sent/Partial can be received` }, 409);
         }
         const WAREHOUSE_ID = 1;
+        const batchId = crypto.randomUUID();   // one id for this receive action (undo target)
         const results = [];
         for (const rc of receipts) {
           const lineId = rc.line_id;
@@ -2090,9 +2247,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
               ).bind(newOnHand, srow.id),
               env.DB.prepare(
                 `INSERT INTO crm_inventory_movements
-                   (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
-                 VALUES (?,?,?,?,?,?,?)`
-              ).bind(line.material_id, WAREHOUSE_ID, recvQty, "po_receive", Number(poId), `received PO #${poId}`, b.created_by ?? 8),
+                   (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id)
+                 VALUES (?,?,?,?,?,?,?,?)`
+              ).bind(line.material_id, WAREHOUSE_ID, recvQty, "po_receive", Number(poId), `received PO #${poId}`, b.created_by ?? 8, batchId),
             ]);
             results.push({
               line_id: line.id, material_id: line.material_id, received: recvQty,
@@ -2116,7 +2273,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         } else {
           await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET status='Partial' WHERE id=?`).bind(poId).run();
         }
-        return json({ ok: true, po_id: Number(poId), status: newStatus, results });
+        return json({ ok: true, po_id: Number(poId), status: newStatus, batch_id: batchId, results });
       }
 
       // 8f. GET /api/reorder/po/current — the open Draft PO with its lines (or null).

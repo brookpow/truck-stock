@@ -483,6 +483,63 @@ export default {
         return json(r.results || []);
       }
 
+      // --- 0a-bis. Per-plumber activity (read-only reporting, surfaces existing
+      // data). GET /api/techs/:stTechId/activity?from=YYYY-MM-DD&to=YYYY-MM-DD ->
+      //   usage:    van stock used on jobs (job_usage, created_by = this plumber)
+      //   restocks: shop->van pulls INTO their van (transfer_in at their van loc;
+      //             tagged by who did it — office vs the tech)
+      //   requests: every "can't find it" they filed (all statuses + types)
+      const activityMatch = p.match(/^\/api\/techs\/(\d+)\/activity$/);
+      if (activityMatch && request.method === "GET") {
+        const tid = activityMatch[1];
+        const to = url.searchParams.get("to") || new Date().toISOString().slice(0, 10);
+        const from = url.searchParams.get("from") || (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 60); return d.toISOString().slice(0, 10); })();
+        const dateOK = "substr(m.created_at,1,10) >= ? AND substr(m.created_at,1,10) <= ?";
+        const tech = await env.DB.prepare(`SELECT st_tech_id, name FROM crm_techs WHERE st_tech_id = ?`).bind(tid).first();
+        const van = await env.DB.prepare(`SELECT id, name FROM crm_inventory_locations WHERE type='truck' AND assigned_tech_id = ? ORDER BY active DESC LIMIT 1`).bind(tid).first();
+
+        // job_usage.reference_id = crm_job_materials.id (the logged line) — the job
+        // lives on that line (job_id + job_number); customer via crm_st_jobs.
+        const usage = (await env.DB.prepare(
+          `SELECT m.created_at, jm.job_id, jm.job_number, c.name AS customer,
+                  m.material_id, mat.name AS material, ABS(m.qty_change) AS qty
+             FROM crm_inventory_movements m
+             LEFT JOIN crm_job_materials jm ON jm.id = m.reference_id
+             LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+             LEFT JOIN crm_materials mat ON mat.id = m.material_id
+            WHERE m.reason='job_usage' AND CAST(m.created_by AS TEXT)=? AND ${dateOK}
+            ORDER BY m.created_at DESC, m.id DESC LIMIT 500`
+        ).bind(tid, from, to).all()).results || [];
+
+        const restocks = van ? (await env.DB.prepare(
+          `SELECT m.created_at, m.material_id, mat.name AS material, m.qty_change AS qty,
+                  m.created_by, m.undone_at, t.name AS by_name
+             FROM crm_inventory_movements m
+             LEFT JOIN crm_materials mat ON mat.id = m.material_id
+             LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(m.created_by AS TEXT)
+            WHERE m.reason='transfer_in' AND m.location_id=? AND ${dateOK}
+              AND (m.batch_id IS NULL OR m.batch_id NOT LIKE 'undo:%')
+            ORDER BY m.created_at DESC, m.id DESC LIMIT 500`
+        ).bind(van.id, from, to).all()).results || [] : [];
+        for (const r of restocks) r.source = String(r.created_by) === String(tid) ? "tech" : (r.by_name || "office");
+
+        const requests = (await env.DB.prepare(
+          `SELECT r.created_at, r.type, r.status, r.quantity, r.custom_description,
+                  r.material_id, mat.name AS material
+             FROM crm_inventory_requests r LEFT JOIN crm_materials mat ON mat.id = r.material_id
+            WHERE CAST(r.requested_by AS TEXT)=? AND substr(r.created_at,1,10) >= ? AND substr(r.created_at,1,10) <= ?
+            ORDER BY r.id DESC LIMIT 500`
+        ).bind(tid, from, to).all()).results || [];
+
+        return json({
+          tech: tech || { st_tech_id: Number(tid), name: "#" + tid },
+          van: van || null, from, to,
+          usage, restocks, requests,
+          totals: { usage: usage.length, restocks: restocks.length, requests: requests.length },
+        });
+      }
+
       // --- 0b. Today's jobs for a tech (ServiceTitan-fed via D1) ----------
       // TWO TIERS, two date windows:
       //   ACTIVE (jobs[]):  the tech's appointment-assignments -> jobs for TODAY
@@ -647,17 +704,28 @@ export default {
       // GET /api/requests?type=special_request&status=pending -> { requests, count }.
       // The type filter is AIRTIGHT: special_request and shop_reorder never mix.
       if (p === "/api/requests" && request.method === "GET") {
+        // Defaults keep the current behavior (pending special-requests → the Home
+        // badge stays "needs action"), but type/status accept 'all' and tech_id
+        // filters by plumber, so the screen can show real history without
+        // conflating special_request vs shop_reorder.
         const type = url.searchParams.get("type") || "special_request";
         const status = url.searchParams.get("status") || "pending";
+        const techId = url.searchParams.get("tech_id");
+        const conds = [], binds = [];
+        if (type !== "all") { conds.push("r.type = ?"); binds.push(type); }
+        if (status !== "all") { conds.push("r.status = ?"); binds.push(status); }
+        if (techId) { conds.push("CAST(r.requested_by AS TEXT) = ?"); binds.push(String(techId)); }
         const rows = (await env.DB.prepare(
-          `SELECT r.id, r.custom_description, r.quantity, r.notes, r.created_at,
-                  r.requested_by, r.truck_location_id, t.name AS tech_name, l.name AS van_name
+          `SELECT r.id, r.type, r.status, r.custom_description, r.quantity, r.notes, r.created_at,
+                  r.requested_by, r.truck_location_id, r.material_id, mat.name AS material,
+                  t.name AS tech_name, l.name AS van_name
              FROM crm_inventory_requests r
              LEFT JOIN crm_techs t ON t.st_tech_id = r.requested_by
              LEFT JOIN crm_inventory_locations l ON l.id = r.truck_location_id
-            WHERE r.type = ? AND r.status = ?
+             LEFT JOIN crm_materials mat ON mat.id = r.material_id
+            ${conds.length ? "WHERE " + conds.join(" AND ") : ""}
             ORDER BY r.id DESC`
-        ).bind(type, status).all()).results || [];
+        ).bind(...binds).all()).results || [];
         return json({ requests: rows, count: rows.length });
       }
 

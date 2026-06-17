@@ -427,6 +427,37 @@ export default {
         return json({ ok: true, st_tech_id: techId, token_version: row?.token_version });
       }
 
+      // ── ServiceTitan sync health (office banner). The crm-worker's */10 incremental
+      // sync writes an 'st-incremental' heartbeat row each run; if that heartbeat is
+      // older than the threshold, the sync has stalled (this is exactly the silent
+      // stall we got bitten by). We key on the HEARTBEAT, not per-table synced_at,
+      // because a low-churn table (customers) can legitimately look stale during a
+      // quiet period — the heartbeat fires every run regardless of changes. Before
+      // the crm-worker fix ships there's no heartbeat yet, so we fall back to jobs'
+      // freshness (high-churn) to avoid a false alarm on day one.
+      if (p === "/api/admin/sync-health" && request.method === "GET") {
+        if (!(await officeAuth(request, env))) return json({ error: "office_auth_required" }, 401);
+        const STALE_MIN = 30;
+        const minsAgo = (ts) => ts == null ? null : Math.round((Date.now() - Date.parse(String(ts).replace(" ", "T") + "Z")) / 60000);
+        const hb = await env.DB.prepare(`SELECT MAX(finished_at) AS t FROM crm_st_sync_log WHERE entity='st-incremental'`).first();
+        const heartbeat_min = minsAgo(hb?.t);
+        const ent = (await env.DB.prepare(
+          `SELECT 'jobs' AS e, MAX(synced_at) AS t FROM crm_st_jobs
+           UNION ALL SELECT 'appointments', MAX(synced_at) FROM crm_st_appointments
+           UNION ALL SELECT 'customers', MAX(synced_at) FROM crm_st_customers
+           UNION ALL SELECT 'assignments', MAX(synced_at) FROM crm_st_appointment_assignments`
+        ).all()).results || [];
+        const entities = ent.map((r) => ({ entity: r.e, last_synced: r.t, minutes_ago: minsAgo(r.t) }));
+        const jobsMin = entities.find((x) => x.entity === "jobs")?.minutes_ago;
+        // Heartbeat present → trust it. No heartbeat yet (pre-fix) → fall back to jobs.
+        const systemic = heartbeat_min != null ? heartbeat_min > STALE_MIN
+                       : (jobsMin != null && jobsMin > 60);
+        const reason = heartbeat_min != null
+          ? `the */10 incremental sync last ran ${heartbeat_min} min ago`
+          : (systemic ? `no sync heartbeat and jobs last changed ${jobsMin} min ago` : null);
+        return json({ stale_threshold_min: STALE_MIN, heartbeat_minutes_ago: heartbeat_min, systemic, reason, entities });
+      }
+
       // ── Scanner health (office banner). SYSTEMIC = API-level breaks that are NOT
       // photo-dependent: vision_unavailable with a hard/config status (404 model-
       // not-found, 401/403 auth, 400) OR network. parse_failed (bad/illegible slip)

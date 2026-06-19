@@ -2227,12 +2227,38 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_stock s
              JOIN crm_materials m ON m.id = s.material_id
             WHERE s.location_id = 1 AND s.on_hand < s.max_qty AND m.is_active = 1
+              -- Hide items dismissed from the reorder, UNTIL the shop row changes
+              -- again (a count/receipt bumps modified_at past the dismiss). A
+              -- dismiss is a view flag only — it never touches stock.
+              AND (s.reorder_dismissed_at IS NULL OR s.modified_at > s.reorder_dismissed_at)
             ORDER BY m.category, m.name`
         ).all()).results || [];
         const items = rows
           .map((r) => ({ ...r, net_need: r.raw_short - (r.already_on_order || 0) }))
           .filter((r) => r.net_need > 0);
         return json({ items });
+      }
+
+      // 8a-2. POST /api/reorder/dismiss  body { material_id, undo? }
+      //   Hide a material from the suggested reorder list (view flag only — sets
+      //   reorder_dismissed_at on the SHOP row, loc 1). It re-surfaces on the next
+      //   shop stock change. Touches NO stock: no movement, no on_hand change.
+      //   undo:true clears the dismiss (safety valve for a misclick).
+      if (p === "/api/reorder/dismiss" && request.method === "POST") {
+        const b = await request.json().catch(() => ({}));
+        const mid = b.material_id;
+        if (mid == null) return json({ error: "material_id required" }, 400);
+        const row = await env.DB.prepare(
+          `SELECT id FROM crm_inventory_stock WHERE location_id = 1 AND material_id = ?`
+        ).bind(mid).first();
+        if (!row) return json({ error: "no shop stock row for this material" }, 404);
+        // ONLY the dismiss flag is written — on_hand/min/max are never touched.
+        await env.DB.prepare(
+          `UPDATE crm_inventory_stock
+              SET reorder_dismissed_at = ${b.undo ? "NULL" : "datetime('now')"}
+            WHERE id = ?`
+        ).bind(row.id).run();
+        return json({ ok: true, material_id: mid, dismissed: !b.undo });
       }
 
       // 8b. POST /api/reorder/po — get-or-create the single open Draft PO and

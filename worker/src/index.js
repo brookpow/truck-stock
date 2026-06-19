@@ -2013,6 +2013,10 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
 
         // Primary write: the catalog row (id is AUTOINCREMENT).
         const numOr = (v, d) => (v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : d);
+        // One-number par model: a catalog item's default min ALWAYS equals its
+        // default max (no 2/10 buffer). Driven by `par`, else default_max/min,
+        // else 0 — so anything added stays on the single-par model.
+        const tmpl = par != null ? par : numOr(b.default_max != null ? b.default_max : b.default_min, 0);
         const ins = await env.DB.prepare(
           `INSERT INTO crm_materials
              (name, category, cost, price, emco_sku, code, bin_location, unit, subcategory, search_terms, default_min, default_max)
@@ -2021,7 +2025,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           name, category, Number(b.cost) || 0, Number(b.price) || 0,
           b.emco_sku || null, b.code || null, b.bin_location || null,
           b.unit || null, b.subcategory || null, b.search_terms || null,
-          numOr(b.default_min, 2), numOr(b.default_max, 10)
+          tmpl, tmpl
         ).run();
         const id = ins.meta?.last_row_id ?? null;
 

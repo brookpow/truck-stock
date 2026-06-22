@@ -300,6 +300,25 @@ function Jobs({ tech, onSignOut }) {
   );
 }
 
+// Add control for a search/browse result. Normal items get the +1 stepper;
+// by-the-foot pipe gets a FEET entry (enter length used, not a count) + "add ft".
+function AddMaterialBtn({ m, saving, add }) {
+  const [feet, setFeet] = useState("");
+  if (!m.track_by_foot) {
+    return <button style={styles.addBtn} disabled={saving} onClick={() => add(m, 1)} aria-label={"add " + m.name}>+</button>;
+  }
+  const f = Number(feet);
+  return (
+    <div style={styles.feetAdd}>
+      <input type="number" inputMode="decimal" min="0" step="0.5" placeholder="feet"
+        value={feet} onChange={(e) => setFeet(e.target.value)}
+        style={styles.feetInput} aria-label={"feet of " + m.name} />
+      <button style={styles.feetAddBtn} disabled={saving || !(f > 0)}
+        onClick={() => { add(m, f); setFeet(""); }} aria-label={"add feet of " + m.name}>add ft</button>
+    </div>
+  );
+}
+
 // ---- Screen 3: material capture ------------------------------------------
 function Capture({ tech, job, onBack }) {
   const [q, setQ] = useState("");
@@ -393,20 +412,23 @@ function Capture({ tech, job, onBack }) {
     return () => clearTimeout(timer.current);
   }, [q]);
 
-  async function add(m) {
+  // qty is COUNT for normal items (the + adds 1) and FEET for by-the-foot pipe.
+  async function add(m, qty = 1) {
     setSaving(true);
     try {
       const res = await logMaterialResilient(job.id, {
         material_id: m.id,
-        quantity: 1,
+        quantity: qty,
         tech_id: tech.st_tech_id,
         job_number: job.num,
         // Display-only fields (underscore-prefixed). The worker ignores unknown
         // keys, so these ride along only to render the queued item optimistically
         // before it syncs. _cost is the catalog estimate; the server freezes the
-        // authoritative cost at flush time.
+        // authoritative cost at flush time. For by-the-foot, the estimate is the
+        // per-FOOT cost (so feet × per-foot reads right before sync).
         _name: m.name,
-        _cost: m.cost,
+        _cost: m.track_by_foot ? (m.cost_per_foot ?? 0) : m.cost,
+        _unit: m.track_by_foot ? "ft" : null,
       });
       setQ(""); setResults([]);
       if (res.queued) {
@@ -541,9 +563,9 @@ function Capture({ tech, job, onBack }) {
         <div key={m.id} style={styles.resultRow}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={styles.ellip}>{m.name}</div>
-            <div style={styles.muted}>{m.category} · {fmt(m.cost)}</div>
+            <div style={styles.muted}>{m.category} · {m.track_by_foot ? `${fmt(m.cost_per_foot)}/ft` : fmt(m.cost)}</div>
           </div>
-          <button style={styles.addBtn} disabled={saving} onClick={() => add(m)} aria-label={"add " + m.name}>+</button>
+          <AddMaterialBtn m={m} saving={saving} add={add} />
         </div>
       ))}
 
@@ -560,9 +582,9 @@ function Capture({ tech, job, onBack }) {
                 <div key={m.id} style={styles.catItemRow}>
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={styles.ellip}>{m.name}</div>
-                    <div style={styles.muted}>{fmt(m.cost)}</div>
+                    <div style={styles.muted}>{m.track_by_foot ? `${fmt(m.cost_per_foot)}/ft` : fmt(m.cost)}</div>
                   </div>
-                  <button style={styles.addBtn} disabled={saving} onClick={() => add(m)} aria-label={"add " + m.name}>+</button>
+                  <AddMaterialBtn m={m} saving={saving} add={add} />
                 </div>
               ))}
             </div>
@@ -611,7 +633,7 @@ function Capture({ tech, job, onBack }) {
               {p.body._name || ("Material #" + p.body.material_id)}
             </div>
             <div style={styles.muted}>
-              ⏳ pending · {fmt(p.body._cost)} × {p.body.quantity} (est.)
+              ⏳ pending · {fmt(p.body._cost)}{p.body._unit === "ft" ? "/ft" : ""} × {p.body.quantity}{p.body._unit === "ft" ? " ft" : ""} (est.)
             </div>
           </div>
           <button
@@ -627,8 +649,8 @@ function Capture({ tech, job, onBack }) {
       {items.map((it) => (
         <div key={it.id} style={styles.loggedRow}>
           <div style={{ minWidth: 0, flex: 1 }}>
-            <div style={styles.ellip}>{it.name || ("Material #" + it.material_id)}</div>
-            <div style={styles.muted}>{fmt(it.unit_cost)} each · {fmt(it.total_cost)}</div>
+            <div style={styles.ellip}>{it.name || ("Material #" + it.material_id)}{it.track_by_foot ? <span style={styles.ftTag}> · feet</span> : null}</div>
+            <div style={styles.muted}>{fmt(it.unit_cost)}{it.track_by_foot ? "/ft" : " each"} · {fmt(it.total_cost)}</div>
           </div>
           {/* Quantity editor. Uncontrolled + key includes quantity so the field
               resets to the server value after a successful edit. Numeric keypad
@@ -1156,6 +1178,10 @@ const styles = {
   fsWarn: { fontSize: 14, color: C.amberInk, padding: "10px 12px", background: C.amberWash, borderRadius: 10, marginBottom: 6 },
   fsBad: { fontSize: 14, color: C.redInk, padding: "10px 12px", background: C.redWash, borderRadius: 10, marginBottom: 6 },
   addBtn: { width: 48, height: 48, flex: "none", marginLeft: 8, fontSize: 26, lineHeight: "48px", border: "none", borderRadius: 13, background: C.blue, color: "#fff", cursor: "pointer" },
+  feetAdd: { display: "flex", alignItems: "center", gap: 6, flex: "none" },
+  feetInput: { ...ctl, width: 64, height: 48, fontSize: 16, textAlign: "center", padding: "0 6px", borderRadius: 12 },
+  feetAddBtn: { height: 48, flex: "none", padding: "0 14px", fontSize: 15, fontWeight: 700, border: "none", borderRadius: 13, background: C.blue, color: "#fff", cursor: "pointer", whiteSpace: "nowrap" },
+  ftTag: { color: C.blueInk, fontWeight: 700, fontSize: 12 },
   browseSection: { marginTop: 10 },
   browseLabel: { fontSize: 11, fontWeight: 700, color: C.ink3, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 },
   catBlock: { marginBottom: 6 },

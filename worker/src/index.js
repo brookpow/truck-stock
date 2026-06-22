@@ -681,7 +681,9 @@ export default {
         // search_terms is a dedicated field for tech vocabulary ("elbow" -> "90 copper ell").
         // is_active filters out retired catalog items. unit/category help the capture UI.
         const r = await env.DB.prepare(
-          `SELECT id, code, emco_sku, name, cost, price, unit, category, search_terms
+          `SELECT id, code, emco_sku, name, cost, price, unit, category, search_terms,
+                  track_by_foot,
+                  ROUND(COALESCE(cost_per_foot_override, CASE WHEN length_ft>0 THEN cost/length_ft END),2) AS cost_per_foot
              FROM crm_materials
             WHERE is_active = 1
               AND (name LIKE ? OR code LIKE ? OR emco_sku LIKE ? OR search_terms LIKE ?)
@@ -696,13 +698,15 @@ export default {
       // browse below the search bar. Lean fields: just what add()/display need.
       if (p === "/api/materials/by-category" && request.method === "GET") {
         const rows = (await env.DB.prepare(
-          `SELECT id, name, cost, category FROM crm_materials WHERE is_active = 1 ORDER BY category, name`
+          `SELECT id, name, cost, category, track_by_foot,
+                  ROUND(COALESCE(cost_per_foot_override, CASE WHEN length_ft>0 THEN cost/length_ft END),2) AS cost_per_foot
+             FROM crm_materials WHERE is_active = 1 ORDER BY category, name`
         ).all()).results || [];
         const map = new Map();
         for (const r of rows) {
           const cat = r.category || "Uncategorized";
           if (!map.has(cat)) map.set(cat, []);
-          map.get(cat).push({ id: r.id, name: r.name, cost: r.cost });
+          map.get(cat).push({ id: r.id, name: r.name, cost: r.cost, track_by_foot: r.track_by_foot, cost_per_foot: r.cost_per_foot });
         }
         const categories = [...map.entries()].map(([name, items]) => ({ name, count: items.length, items }));
         return json({ categories });
@@ -786,10 +790,23 @@ export default {
         }
         // Freeze cost from catalog at time of use.
         const mat = await env.DB.prepare(
-          `SELECT cost FROM crm_materials WHERE id = ?`
+          `SELECT cost, track_by_foot, length_ft, cost_per_foot_override FROM crm_materials WHERE id = ?`
         ).bind(b.material_id).first();
-        const unitCost = mat ? (mat.cost ?? 0) : 0;
-        const totalCost = unitCost * b.quantity;
+        const byTheFoot = !!(mat && mat.track_by_foot);
+        // By-the-foot: quantity is FEET, and we freeze the EFFECTIVE PER-FOOT cost
+        // (override, else cost/length_ft) — NEVER the per-stick `cost` (that would
+        // be a ~length× overcharge). Normal each-items freeze the each `cost`.
+        let unitCost = 0;
+        if (mat) {
+          if (byTheFoot) {
+            unitCost = mat.cost_per_foot_override != null ? mat.cost_per_foot_override
+                     : (mat.length_ft > 0 ? mat.cost / mat.length_ft : 0);
+          } else {
+            unitCost = mat.cost ?? 0;
+          }
+        }
+        unitCost = Math.round(unitCost * 100) / 100;          // store to the cent
+        const totalCost = Math.round(unitCost * b.quantity * 100) / 100;
 
         // is_prepull lets you distinguish materials pulled for a job vs actually used.
         // Defaults to 0 (used) unless the caller marks it a pre-pull.
@@ -816,9 +833,11 @@ export default {
         // The usage record above is the SOURCE OF TRUTH and is already committed.
         // Everything below adjusts van stock as a best-effort side effect: any
         // failure here is caught and reported, NEVER fatal to the material log.
-        // We deduct only from the logging tech's own van.
-        let stock = { deducted: false, reason: "no_van_for_tech" };
-        try {
+        // We deduct only from the logging tech's own van. By-the-foot items NEVER
+        // touch inventory — feet used is job-cost-only, fully decoupled from the
+        // physical lengths (which are counted/reordered manually).
+        let stock = { deducted: false, reason: byTheFoot ? "by_the_foot" : "no_van_for_tech" };
+        if (!byTheFoot) try {
           // Resolve the tech's active van. tech_id in the log body is the
           // ServiceTitan id, which is what crm_inventory_locations stores in
           // assigned_tech_id. active=1 excludes the retired test rig.
@@ -896,7 +915,7 @@ export default {
           // colliding with m.name (the material name). Both joins are LEFT so
           // a missing material or unmapped tech still returns the line.
           `SELECT jm.id, jm.material_id, jm.quantity, jm.unit_cost, jm.total_cost,
-                  jm.notes, jm.is_prepull, jm.tech_id, m.name, m.code, m.unit,
+                  jm.notes, jm.is_prepull, jm.tech_id, m.name, m.code, m.unit, m.track_by_foot,
                   t.name AS tech_name
              FROM crm_job_materials jm
              LEFT JOIN crm_materials m ON m.id = jm.material_id
@@ -1602,6 +1621,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_stock s
              JOIN crm_materials m ON m.id = s.material_id
             WHERE s.location_id = ? AND s.on_hand < s.min_qty
+              AND m.track_by_foot = 0   -- by-the-foot pipe is pulled/counted manually
             ORDER BY m.name`
         ).bind(locationId).all();
         return json({ location_id: Number(locationId) || locationId, items: r.results || [] });
@@ -1994,7 +2014,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (!all) where.push("is_active = 1");
         if (q) where.push("(name LIKE ? OR emco_sku LIKE ? OR code LIKE ?)");
         const stmt = env.DB.prepare(
-          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max
+          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max, track_by_foot
              FROM crm_materials
             ${where.length ? "WHERE " + where.join(" AND ") : ""}
             ORDER BY category, name`
@@ -2231,6 +2251,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_stock s
              JOIN crm_materials m ON m.id = s.material_id
             WHERE s.location_id = 1 AND s.on_hand < s.max_qty AND m.is_active = 1
+              AND m.track_by_foot = 0   -- by-the-foot pipe lengths are reordered manually
               -- Hide items dismissed from the reorder, UNTIL the shop row changes
               -- again (a count/receipt bumps modified_at past the dismiss). A
               -- dismiss is a view flag only — it never touches stock.
@@ -2297,26 +2318,64 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           ).bind(...chunk).all()).results || [];
           for (const c of cr) costMap[c.id] = c;
         }
-        const stmts = [env.DB.prepare(`DELETE FROM crm_inventory_po_items WHERE po_id=?`).bind(poId)];
-        let total = 0;
+        // Replace only the AUTO (below-par) lines — manually-added lines persist.
+        const stmts = [env.DB.prepare(`DELETE FROM crm_inventory_po_items WHERE po_id=? AND source='auto'`).bind(poId)];
         for (const [mid, qty] of byMid) {
           const cost = costMap[mid]?.cost ?? 0;
           const lineTotal = Math.round(cost * qty * 100) / 100;
-          total += lineTotal;
           stmts.push(env.DB.prepare(
             `INSERT INTO crm_inventory_po_items
-               (po_id, material_id, qty_ordered, qty_received, vendor_part_number, unit_cost, line_total)
-             VALUES (?,?,?,0,?,?,?)`
+               (po_id, material_id, qty_ordered, qty_received, vendor_part_number, unit_cost, line_total, source)
+             VALUES (?,?,?,0,?,?,?,'auto')`
           ).bind(poId, mid, qty, costMap[mid]?.emco_sku ?? null, cost, lineTotal));
         }
-        total = Math.round(total * 100) / 100;
-        stmts.push(env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(total, poId));
         await env.DB.batch(stmts);
+        // Total spans ALL lines (auto + persisted manual).
+        const totalRow = await env.DB.prepare(`SELECT ROUND(COALESCE(SUM(line_total),0),2) AS total FROM crm_inventory_po_items WHERE po_id=?`).bind(poId).first();
+        const total = totalRow?.total ?? 0;
+        await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(total, poId).run();
         const lines = (await env.DB.prepare(
           `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku,
-                  pi.qty_ordered, pi.unit_cost, pi.line_total
+                  pi.qty_ordered, pi.unit_cost, pi.line_total, pi.source
              FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
-            WHERE pi.po_id=? ORDER BY m.name`
+            WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
+        ).bind(poId).all()).results || [];
+        return json({ ok: true, po_id: poId, status: "Draft", total, lines });
+      }
+
+      // 8b-2. POST /api/reorder/po/add-line  { material_id, qty }
+      //   Manually add ANY catalog item to the current Draft PO — NO below-par
+      //   requirement (pipe lengths, special orders, anticipated needs). Tagged
+      //   source='manual' so it survives the suggested-rebuild. Ordered by the
+      //   catalog `cost` (per-LENGTH for pipe). Upserts by material (re-adding
+      //   updates the qty); a material already auto-suggested becomes 'manual'.
+      if (p === "/api/reorder/po/add-line" && request.method === "POST") {
+        const b = await request.json().catch(() => ({}));
+        const mid = b.material_id;
+        const qty = Math.floor(Number(b.qty) || 0);
+        if (mid == null || qty <= 0) return json({ error: "material_id and qty>0 required" }, 400);
+        const mat = await env.DB.prepare(`SELECT id, cost, emco_sku FROM crm_materials WHERE id=?`).bind(mid).first();
+        if (!mat) return json({ error: "material not found" }, 404);
+        let po = await env.DB.prepare(`SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`).first();
+        if (!po) {
+          const ins = await env.DB.prepare(`INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by) VALUES ('EMCO','Draft',?)`).bind(b.created_by ?? 8).run();
+          po = { id: ins.meta?.last_row_id };
+        }
+        const poId = po.id;
+        const cost = mat.cost ?? 0;
+        const lineTotal = Math.round(cost * qty * 100) / 100;
+        const existing = await env.DB.prepare(`SELECT id FROM crm_inventory_po_items WHERE po_id=? AND material_id=?`).bind(poId, mid).first();
+        if (existing) {
+          await env.DB.prepare(`UPDATE crm_inventory_po_items SET qty_ordered=?, unit_cost=?, line_total=?, source='manual' WHERE id=?`).bind(qty, cost, lineTotal, existing.id).run();
+        } else {
+          await env.DB.prepare(`INSERT INTO crm_inventory_po_items (po_id, material_id, qty_ordered, qty_received, vendor_part_number, unit_cost, line_total, source) VALUES (?,?,?,0,?,?,?,'manual')`).bind(poId, mid, qty, mat.emco_sku ?? null, cost, lineTotal).run();
+        }
+        const totalRow = await env.DB.prepare(`SELECT ROUND(COALESCE(SUM(line_total),0),2) AS total FROM crm_inventory_po_items WHERE po_id=?`).bind(poId).first();
+        const total = totalRow?.total ?? 0;
+        await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(total, poId).run();
+        const lines = (await env.DB.prepare(
+          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku, pi.qty_ordered, pi.unit_cost, pi.line_total, pi.source
+             FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
         ).bind(poId).all()).results || [];
         return json({ ok: true, po_id: poId, status: "Draft", total, lines });
       }
@@ -2412,9 +2471,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         ).first();
         if (!po) return json({ po: null });
         const lines = (await env.DB.prepare(
-          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku, pi.qty_ordered, pi.unit_cost, pi.line_total
+          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku, pi.qty_ordered, pi.unit_cost, pi.line_total, pi.source
              FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
-            WHERE pi.po_id=? ORDER BY m.name`
+            WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
         ).bind(po.id).all()).results || [];
         return json({ po: { ...po, lines } });
       }

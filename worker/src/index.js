@@ -682,8 +682,8 @@ export default {
         // is_active filters out retired catalog items. unit/category help the capture UI.
         const r = await env.DB.prepare(
           `SELECT id, code, emco_sku, name, cost, price, unit, category, search_terms,
-                  track_by_foot,
-                  ROUND(COALESCE(cost_per_foot_override, CASE WHEN length_ft>0 THEN cost/length_ft END),2) AS cost_per_foot
+                  conversion_factor, use_unit, purchase_unit, deduct_on_use,
+                  ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials
             WHERE is_active = 1
               AND (name LIKE ? OR code LIKE ? OR emco_sku LIKE ? OR search_terms LIKE ?)
@@ -698,15 +698,15 @@ export default {
       // browse below the search bar. Lean fields: just what add()/display need.
       if (p === "/api/materials/by-category" && request.method === "GET") {
         const rows = (await env.DB.prepare(
-          `SELECT id, name, cost, category, track_by_foot,
-                  ROUND(COALESCE(cost_per_foot_override, CASE WHEN length_ft>0 THEN cost/length_ft END),2) AS cost_per_foot
+          `SELECT id, name, cost, category, conversion_factor, use_unit, deduct_on_use,
+                  ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials WHERE is_active = 1 ORDER BY category, name`
         ).all()).results || [];
         const map = new Map();
         for (const r of rows) {
           const cat = r.category || "Uncategorized";
           if (!map.has(cat)) map.set(cat, []);
-          map.get(cat).push({ id: r.id, name: r.name, cost: r.cost, track_by_foot: r.track_by_foot, cost_per_foot: r.cost_per_foot });
+          map.get(cat).push({ id: r.id, name: r.name, cost: r.cost, conversion_factor: r.conversion_factor, use_unit: r.use_unit, deduct_on_use: r.deduct_on_use, cost_per_use: r.cost_per_use });
         }
         const categories = [...map.entries()].map(([name, items]) => ({ name, count: items.length, items }));
         return json({ categories });
@@ -790,21 +790,21 @@ export default {
         }
         // Freeze cost from catalog at time of use.
         const mat = await env.DB.prepare(
-          `SELECT cost, track_by_foot, length_ft, cost_per_foot_override FROM crm_materials WHERE id = ?`
+          `SELECT cost, conversion_factor, cost_per_use_override, deduct_on_use FROM crm_materials WHERE id = ?`
         ).bind(b.material_id).first();
-        const byTheFoot = !!(mat && mat.track_by_foot);
-        // By-the-foot: quantity is FEET, and we freeze the EFFECTIVE PER-FOOT cost
-        // (override, else cost/length_ft) — NEVER the per-stick `cost` (that would
-        // be a ~length× overcharge). Normal each-items freeze the each `cost`.
+        // quantity is always in USE-UNITS, and we ALWAYS freeze the per-USE cost:
+        //   override, else cost / conversion_factor — NEVER the per-purchase `cost`
+        //   when conversion > 1 (that would be a ~conversion× overcharge: a 12ft
+        //   stick at $47.40 must freeze at $3.95/ft, not $47.40/ft). A normal item
+        //   has conversion=1, so cost/1 = cost — identical to before.
         let unitCost = 0;
         if (mat) {
-          if (byTheFoot) {
-            unitCost = mat.cost_per_foot_override != null ? mat.cost_per_foot_override
-                     : (mat.length_ft > 0 ? mat.cost / mat.length_ft : 0);
-          } else {
-            unitCost = mat.cost ?? 0;
-          }
+          const conv = mat.conversion_factor;
+          unitCost = mat.cost_per_use_override != null ? mat.cost_per_use_override
+                   : (conv > 0 ? mat.cost / conv : (mat.cost ?? 0));
         }
+        // deduct_on_use=0 (pipe, untracked bag) = cost-only: never moves stock.
+        const noDeduct = !!(mat && mat.deduct_on_use === 0);
         unitCost = Math.round(unitCost * 100) / 100;          // store to the cent
         const totalCost = Math.round(unitCost * b.quantity * 100) / 100;
 
@@ -833,11 +833,11 @@ export default {
         // The usage record above is the SOURCE OF TRUTH and is already committed.
         // Everything below adjusts van stock as a best-effort side effect: any
         // failure here is caught and reported, NEVER fatal to the material log.
-        // We deduct only from the logging tech's own van. By-the-foot items NEVER
-        // touch inventory — feet used is job-cost-only, fully decoupled from the
-        // physical lengths (which are counted/reordered manually).
-        let stock = { deducted: false, reason: byTheFoot ? "by_the_foot" : "no_van_for_tech" };
-        if (!byTheFoot) try {
+        // We deduct only from the logging tech's own van. deduct_on_use=0 items
+        // (pipe, untracked bag) NEVER touch inventory — usage is job-cost-only,
+        // fully decoupled from the physical stock (counted/reordered manually).
+        let stock = { deducted: false, reason: noDeduct ? "cost_only" : "no_van_for_tech" };
+        if (!noDeduct) try {
           // Resolve the tech's active van. tech_id in the log body is the
           // ServiceTitan id, which is what crm_inventory_locations stores in
           // assigned_tech_id. active=1 excludes the retired test rig.
@@ -915,7 +915,7 @@ export default {
           // colliding with m.name (the material name). Both joins are LEFT so
           // a missing material or unmapped tech still returns the line.
           `SELECT jm.id, jm.material_id, jm.quantity, jm.unit_cost, jm.total_cost,
-                  jm.notes, jm.is_prepull, jm.tech_id, m.name, m.code, m.unit, m.track_by_foot,
+                  jm.notes, jm.is_prepull, jm.tech_id, m.name, m.code, m.unit, m.use_unit, m.deduct_on_use,
                   t.name AS tech_name
              FROM crm_job_materials jm
              LEFT JOIN crm_materials m ON m.id = jm.material_id
@@ -1621,7 +1621,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_stock s
              JOIN crm_materials m ON m.id = s.material_id
             WHERE s.location_id = ? AND s.on_hand < s.min_qty
-              AND m.track_by_foot = 0   -- by-the-foot pipe is pulled/counted manually
+              AND m.deduct_on_use = 1   -- cost-only items (pipe, untracked bag) are pulled/counted manually
             ORDER BY m.name`
         ).bind(locationId).all();
         return json({ location_id: Number(locationId) || locationId, items: r.results || [] });
@@ -2014,7 +2014,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (!all) where.push("is_active = 1");
         if (q) where.push("(name LIKE ? OR emco_sku LIKE ? OR code LIKE ?)");
         const stmt = env.DB.prepare(
-          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max, track_by_foot
+          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max,
+                  purchase_unit, use_unit, conversion_factor, cost_per_use_override, deduct_on_use,
+                  ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials
             ${where.length ? "WHERE " + where.join(" AND ") : ""}
             ORDER BY category, name`
@@ -2094,7 +2096,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
       if (catMatch && request.method === "PATCH") {
         const id = catMatch[1];
         const b = await request.json();
-        const fields = ["name","category","cost","price","emco_sku","code","bin_location","unit","subcategory","search_terms","is_active","default_min","default_max"];
+        const fields = ["name","category","cost","price","emco_sku","code","bin_location","unit","subcategory","search_terms","is_active","default_min","default_max",
+                        "purchase_unit","use_unit","conversion_factor","cost_per_use_override","deduct_on_use"];
+        const numeric = ["cost","price","is_active","default_min","default_max","conversion_factor","deduct_on_use"];
         const sets = []; const binds = [];
         for (const f of fields) {
           if (b[f] === undefined) continue;
@@ -2103,7 +2107,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           }
           sets.push(`${f} = ?`);
           binds.push(
-            ["cost","price","is_active","default_min","default_max"].includes(f) ? Number(b[f])
+            // cost_per_use_override is the nullable escape hatch: blank/null clears it.
+            f === "cost_per_use_override" ? (b[f] === null || b[f] === "" ? null : Number(b[f]))
+              : numeric.includes(f) ? Number(b[f])
               : (b[f] === null ? null : String(b[f]))
           );
         }
@@ -2132,7 +2138,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           await updateStmt.run();
         }
         const row = await env.DB.prepare(
-          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max
+          `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max,
+                  purchase_unit, use_unit, conversion_factor, cost_per_use_override, deduct_on_use,
+                  ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials WHERE id=?`
         ).bind(id).first();
         return json({ ok: true, item: row, cost_logged: costChanging });
@@ -2251,7 +2259,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_stock s
              JOIN crm_materials m ON m.id = s.material_id
             WHERE s.location_id = 1 AND s.on_hand < s.max_qty AND m.is_active = 1
-              AND m.track_by_foot = 0   -- by-the-foot pipe lengths are reordered manually
+              AND m.deduct_on_use = 1   -- cost-only items (pipe, untracked bag) are reordered manually
               -- Hide items dismissed from the reorder, UNTIL the shop row changes
               -- again (a count/receipt bumps modified_at past the dismiss). A
               -- dismiss is a view flag only — it never touches stock.

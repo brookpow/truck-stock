@@ -303,18 +303,21 @@ function Jobs({ tech, onSignOut }) {
 // Add control for a search/browse result. Normal items get the +1 stepper;
 // by-the-foot pipe gets a FEET entry (enter length used, not a count) + "add ft".
 function AddMaterialBtn({ m, saving, add }) {
-  const [feet, setFeet] = useState("");
-  if (!m.track_by_foot) {
+  const [qty, setQty] = useState("");
+  // Normal each-item (conversion ×1): the quick +1 stepper.
+  if (!(m.conversion_factor && m.conversion_factor !== 1)) {
     return <button style={styles.addBtn} disabled={saving} onClick={() => add(m, 1)} aria-label={"add " + m.name}>+</button>;
   }
-  const f = Number(feet);
+  // Converted item (pipe → ft, bag → each): type the use-units, labeled by use_unit.
+  const u = m.use_unit || "use";
+  const n = Number(qty);
   return (
     <div style={styles.feetAdd}>
-      <input type="number" inputMode="decimal" min="0" step="0.5" placeholder="feet"
-        value={feet} onChange={(e) => setFeet(e.target.value)}
-        style={styles.feetInput} aria-label={"feet of " + m.name} />
-      <button style={styles.feetAddBtn} disabled={saving || !(f > 0)}
-        onClick={() => { add(m, f); setFeet(""); }} aria-label={"add feet of " + m.name}>add ft</button>
+      <input type="number" inputMode="decimal" min="0" step="0.5" placeholder={u}
+        value={qty} onChange={(e) => setQty(e.target.value)}
+        style={styles.feetInput} aria-label={u + " of " + m.name} />
+      <button style={styles.feetAddBtn} disabled={saving || !(n > 0)}
+        onClick={() => { add(m, n); setQty(""); }} aria-label={"add " + u + " of " + m.name}>add {u}</button>
     </div>
   );
 }
@@ -424,11 +427,11 @@ function Capture({ tech, job, onBack }) {
         // Display-only fields (underscore-prefixed). The worker ignores unknown
         // keys, so these ride along only to render the queued item optimistically
         // before it syncs. _cost is the catalog estimate; the server freezes the
-        // authoritative cost at flush time. For by-the-foot, the estimate is the
-        // per-FOOT cost (so feet × per-foot reads right before sync).
+        // authoritative cost at flush time. For a converted item (pipe, bag), the
+        // estimate is the per-USE cost (so use-units × per-use reads right before sync).
         _name: m.name,
-        _cost: m.track_by_foot ? (m.cost_per_foot ?? 0) : m.cost,
-        _unit: m.track_by_foot ? "ft" : null,
+        _cost: (m.conversion_factor && m.conversion_factor !== 1) ? (m.cost_per_use ?? 0) : m.cost,
+        _unit: (m.conversion_factor && m.conversion_factor !== 1) ? (m.use_unit || "use") : null,
       });
       setQ(""); setResults([]);
       if (res.queued) {
@@ -563,7 +566,7 @@ function Capture({ tech, job, onBack }) {
         <div key={m.id} style={styles.resultRow}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={styles.ellip}>{m.name}</div>
-            <div style={styles.muted}>{m.category} · {m.track_by_foot ? `${fmt(m.cost_per_foot)}/ft` : fmt(m.cost)}</div>
+            <div style={styles.muted}>{m.category} · {(m.conversion_factor && m.conversion_factor !== 1) ? `${fmt(m.cost_per_use)}/${m.use_unit}` : fmt(m.cost)}</div>
           </div>
           <AddMaterialBtn m={m} saving={saving} add={add} />
         </div>
@@ -582,7 +585,7 @@ function Capture({ tech, job, onBack }) {
                 <div key={m.id} style={styles.catItemRow}>
                   <div style={{ minWidth: 0, flex: 1 }}>
                     <div style={styles.ellip}>{m.name}</div>
-                    <div style={styles.muted}>{m.track_by_foot ? `${fmt(m.cost_per_foot)}/ft` : fmt(m.cost)}</div>
+                    <div style={styles.muted}>{(m.conversion_factor && m.conversion_factor !== 1) ? `${fmt(m.cost_per_use)}/${m.use_unit}` : fmt(m.cost)}</div>
                   </div>
                   <AddMaterialBtn m={m} saving={saving} add={add} />
                 </div>
@@ -633,7 +636,7 @@ function Capture({ tech, job, onBack }) {
               {p.body._name || ("Material #" + p.body.material_id)}
             </div>
             <div style={styles.muted}>
-              ⏳ pending · {fmt(p.body._cost)}{p.body._unit === "ft" ? "/ft" : ""} × {p.body.quantity}{p.body._unit === "ft" ? " ft" : ""} (est.)
+              ⏳ pending · {fmt(p.body._cost)}{p.body._unit ? "/" + p.body._unit : ""} × {p.body.quantity}{p.body._unit ? " " + p.body._unit : ""} (est.)
             </div>
           </div>
           <button
@@ -649,8 +652,8 @@ function Capture({ tech, job, onBack }) {
       {items.map((it) => (
         <div key={it.id} style={styles.loggedRow}>
           <div style={{ minWidth: 0, flex: 1 }}>
-            <div style={styles.ellip}>{it.name || ("Material #" + it.material_id)}{it.track_by_foot ? <span style={styles.ftTag}> · feet</span> : null}</div>
-            <div style={styles.muted}>{fmt(it.unit_cost)}{it.track_by_foot ? "/ft" : " each"} · {fmt(it.total_cost)}</div>
+            <div style={styles.ellip}>{it.name || ("Material #" + it.material_id)}{(it.use_unit && it.use_unit !== "each") ? <span style={styles.ftTag}> · {it.use_unit}</span> : null}</div>
+            <div style={styles.muted}>{fmt(it.unit_cost)}{(it.use_unit && it.use_unit !== "each") ? "/" + it.use_unit : " each"} · {fmt(it.total_cost)}</div>
           </div>
           {/* Quantity editor. Uncontrolled + key includes quantity so the field
               resets to the server value after a successful edit. Numeric keypad

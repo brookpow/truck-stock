@@ -1871,6 +1871,67 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           b.lines.push({ material_id: r.material_id, material: r.material, qty: r.qty_change, undone: !!r.undone_at });
         }
         const batches = [...byBatch.values()].map((b) => ({ ...b, undone: b.lines.every((l) => l.undone) })).slice(0, 25);
+
+        // Covered-usage rollup: a restock refills the van to par to cover the
+        // usage since the PREVIOUS restock — so a batch has no single job, but it
+        // DOES cover the jobs whose van usage falls in (prevRestock, thisBatch].
+        // Attach those jobs (date · customer · address) so the office can tell
+        // what each refill was for. This is a time-window attribution, not a
+        // stored 1:1 link (a pull-to-par can't map a unit to a single job).
+        const vloc = await env.DB.prepare(
+          `SELECT assigned_tech_id FROM crm_inventory_locations WHERE id = ?`
+        ).bind(locId).first();
+        const techId = vloc && vloc.assigned_tech_id;
+        if (techId != null && batches.length) {
+          const asc = [...batches].reverse();                  // oldest → newest
+          const oldestTs = asc[0].created_at;
+          // Floor = the transfer_in immediately BEFORE the oldest displayed batch
+          // (so that batch gets a real window), else the epoch. Exclude the oldest
+          // batch's OWN legs — its 7 legs can span a second (17:04:40→:41), and the
+          // batch's representative created_at is the max, so `< oldestTs` would
+          // otherwise match its own earlier legs and collapse the window to ~1s.
+          const prev = await env.DB.prepare(
+            `SELECT MAX(created_at) AS ts FROM crm_inventory_movements
+              WHERE location_id = ? AND reason = 'transfer_in'
+                AND batch_id IS NOT NULL AND batch_id NOT LIKE 'undo:%'
+                AND batch_id <> ?
+                AND created_at < ?`
+          ).bind(locId, asc[0].batch_id, oldestTs).first();
+          const floor = (prev && prev.ts) || "1970-01-01";
+          // Each batch's window starts at the prior batch's time (floor for the oldest).
+          const starts = asc.map((b, i) => (i === 0 ? floor : asc[i - 1].created_at));
+          // All van-usage lines (this van's tech, job_usage-backed) since the floor.
+          const usage = (await env.DB.prepare(
+            `SELECT jm.created_at, jm.job_id, j.job_number,
+                    c.name AS customer, c.address_street, c.address_city
+               FROM crm_job_materials jm
+               LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+               LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+              WHERE jm.tech_id = ? AND jm.created_at > ?
+                AND EXISTS (SELECT 1 FROM crm_inventory_movements mv
+                             WHERE mv.reference_id = jm.id AND mv.reason = 'job_usage'
+                               AND mv.location_id = ?)
+              ORDER BY jm.created_at`
+          ).bind(techId, floor, locId).all()).results || [];
+          for (const u of usage) {
+            // Bucket into the batch whose window (starts[i], asc[i].created_at] holds it.
+            let idx = -1;
+            for (let i = 0; i < asc.length; i++) {
+              if (u.created_at > starts[i] && u.created_at <= asc[i].created_at) { idx = i; break; }
+            }
+            if (idx === -1) continue;                          // usage not yet refilled by any shown batch
+            const b = asc[idx];
+            if (!b._jobs) b._jobs = new Map();
+            const key = u.job_id != null ? "j" + u.job_id : "t" + u.created_at;
+            if (!b._jobs.has(key)) b._jobs.set(key, {
+              job_id: u.job_id, job_number: u.job_number, customer: u.customer,
+              address: [u.address_street, u.address_city].filter(Boolean).join(", ") || null,
+              first_used: u.created_at, last_used: u.created_at, lines: 0,
+            });
+            const jj = b._jobs.get(key); jj.lines += 1; jj.last_used = u.created_at;
+          }
+          for (const b of batches) { b.covered_jobs = b._jobs ? [...b._jobs.values()] : []; delete b._jobs; }
+        }
         return json({ location_id: locId, batches });
       }
 

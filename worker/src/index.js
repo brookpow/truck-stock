@@ -588,8 +588,8 @@ export default {
         const tid = parseInt(url.searchParams.get("st_tech_id") || "", 10);
         if (!tid) return json({ jobs: [], recent: [], fallback: "manual" });
         const { dayStr, start, end } = pacificDayBoundsUTC();
-        const recentStart = new Date(Date.parse(start) - 3 * 86400000)
-          .toISOString().replace(/\.\d{3}Z$/, "Z");                 // today's Pacific midnight, -3 days
+        const recentStart = new Date(Date.parse(start) - 7 * 86400000)
+          .toISOString().replace(/\.\d{3}Z$/, "Z");                 // today's Pacific midnight, -7 days (covers a weekend gap)
         const addr =
           `TRIM(COALESCE(c.address_street,'') ||
                 CASE WHEN c.address_city IS NOT NULL THEN ', ' || c.address_city ELSE '' END)`;

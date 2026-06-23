@@ -1717,6 +1717,70 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         });
       }
 
+      // --- 5a-ter. Recent usage for correction (NOT restock-anchored) -------
+      // GET /api/restock/:locationId/recent-usage?days=7
+      // Same join as by-job, but windowed by a ROLLING N-day window instead of
+      // the last-restock anchor — so a mis-logged line stays reachable even after
+      // a restock rolled it off the by-job view. Keeps the EXISTS job_usage-at-
+      // this-loc guard, so every row is a real, 1:1-reversible van deduction
+      // (delete -> DELETE /jobs/:id/materials/:lineId reverses THAT line's usage).
+      // Powers the office "Correct a mis-logged item" panel. Read-only.
+      const recentUsageMatch = p.match(/^\/api\/restock\/([^/]+)\/recent-usage$/);
+      if (recentUsageMatch && request.method === "GET") {
+        const locationId = recentUsageMatch[1];
+        const loc = await env.DB.prepare(
+          `SELECT id, type, assigned_tech_id FROM crm_inventory_locations WHERE id = ?`
+        ).bind(locationId).first();
+        if (!loc) return json({ error: "location not found" }, 404);
+        if (loc.type !== "truck") return json({ error: "location is not a truck" }, 400);
+
+        const days = Math.min(30, Math.max(1, parseInt(url.searchParams.get("days") || "7", 10) || 7));
+        const win = `-${days} days`;
+
+        const rows = (await env.DB.prepare(
+          `SELECT jm.id AS line_id, jm.job_id, jm.material_id, m.name AS material, m.emco_sku,
+                  jm.quantity, jm.unit_cost, jm.total_cost, jm.created_at,
+                  j.job_number, j.status AS job_status,
+                  c.name AS customer, c.address_street, c.address_city
+             FROM crm_job_materials jm
+             JOIN crm_materials m ON m.id = jm.material_id
+             LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+            WHERE jm.tech_id = ?
+              AND jm.created_at >= datetime('now', ?)
+              AND EXISTS (SELECT 1 FROM crm_inventory_movements mv
+                           WHERE mv.reference_id = jm.id AND mv.reason = 'job_usage'
+                             AND mv.location_id = ?)
+            ORDER BY jm.created_at DESC, j.job_number`
+        ).bind(loc.assigned_tech_id, win, locationId).all()).results || [];
+
+        // Group into jobs (newest line first preserved within each job).
+        const byJob = new Map();
+        for (const r of rows) {
+          const key = r.job_id ?? `unknown-${r.line_id}`;
+          if (!byJob.has(key)) {
+            byJob.set(key, {
+              job_id: r.job_id, job_number: r.job_number, status: r.job_status,
+              customer: r.customer,
+              address: [r.address_street, r.address_city].filter(Boolean).join(", ") || null,
+              materials: [],
+            });
+          }
+          byJob.get(key).materials.push({
+            line_id: r.line_id, material_id: r.material_id, material: r.material,
+            emco_sku: r.emco_sku, quantity: r.quantity,
+            unit_cost: r.unit_cost, total_cost: r.total_cost, created_at: r.created_at,
+          });
+        }
+
+        return json({
+          location_id: Number(locationId) || locationId,
+          tech_id: loc.assigned_tech_id,
+          days,
+          jobs: [...byJob.values()],
+        });
+      }
+
       // --- 5. Confirm a van restock --------------------------------------
       // POST /api/restock/:locationId/confirm
       // Body: { items: [{ material_id, action, qty }], created_by? }

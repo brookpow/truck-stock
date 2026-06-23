@@ -2449,6 +2449,40 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         return json({ ok: true, po_id: poId, status: "Draft", total, lines });
       }
 
+      // 8b-3. DELETE /api/reorder/po/line/:lineId — remove ONE line from a DRAFT PO.
+      //   A draft is planned-only: nothing ordered or received, so deleting just
+      //   removes the row + recomputes the total — ZERO stock movement (works for
+      //   both 'auto' and 'manual' lines).
+      //   GUARD (load-bearing): status='Draft' ONLY. REFUSE Sent/Received (409).
+      //   Received stock moved via a po_receive movement whose reference_id is the
+      //   PO id — a PER-PO AGGREGATE, NOT a 1:1 line→movement pointer — so an
+      //   ad-hoc reversal here would double-deduct real inventory. Received lines
+      //   must be reversed through the audited po_receive-undo, never this route.
+      const delLineMatch = p.match(/^\/api\/reorder\/po\/line\/(\d+)$/);
+      if (delLineMatch && request.method === "DELETE") {
+        const lineId = Number(delLineMatch[1]);
+        const line = await env.DB.prepare(
+          `SELECT pi.id, pi.po_id, po.status
+             FROM crm_inventory_po_items pi
+             JOIN crm_inventory_purchase_orders po ON po.id = pi.po_id
+            WHERE pi.id = ?`
+        ).bind(lineId).first();
+        if (!line) return json({ error: "line not found" }, 404);
+        if (line.status !== "Draft") {
+          return json({ error: `Cannot delete a line on a ${line.status} PO — only Draft lines can be removed. Received stock must be reversed via the receive-undo, never an ad-hoc delete.` }, 409);
+        }
+        const poId = line.po_id;
+        await env.DB.prepare(`DELETE FROM crm_inventory_po_items WHERE id = ?`).bind(lineId).run();
+        const totalRow = await env.DB.prepare(`SELECT ROUND(COALESCE(SUM(line_total),0),2) AS total FROM crm_inventory_po_items WHERE po_id=?`).bind(poId).first();
+        const total = totalRow?.total ?? 0;
+        await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(total, poId).run();
+        const lines = (await env.DB.prepare(
+          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku, pi.qty_ordered, pi.unit_cost, pi.line_total, pi.source
+             FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
+        ).bind(poId).all()).results || [];
+        return json({ ok: true, po_id: poId, status: "Draft", total, lines, deleted_line_id: lineId });
+      }
+
       // 8c. POST /api/reorder/po/:id/send — Draft -> Sent, stamp sent_at.
       const sendMatch = p.match(/^\/api\/reorder\/po\/(\d+)\/send$/);
       if (sendMatch && request.method === "POST") {

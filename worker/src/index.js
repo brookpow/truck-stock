@@ -533,6 +533,7 @@ export default {
         // lives on that line (job_id + job_number); customer via crm_st_jobs.
         const usage = (await env.DB.prepare(
           `SELECT m.created_at, jm.job_id, jm.job_number, c.name AS customer,
+                  c.address_street, c.address_city, jm.total_cost AS cost,
                   m.material_id, mat.name AS material, ABS(m.qty_change) AS qty
              FROM crm_inventory_movements m
              LEFT JOIN crm_job_materials jm ON jm.id = m.reference_id
@@ -563,12 +564,68 @@ export default {
             ORDER BY r.id DESC LIMIT 500`
         ).bind(tid, from, to).all()).results || [];
 
+        // Scanned-receipt parts (crm_job_purchases) for this tech in the window —
+        // per-job material cost = van (usage above) + receipts (receipt_total,
+        // tax-incl cost of record), matching GP's "Materials = van + receipts".
+        // Receipt-matched lines never create a job_usage movement, so the usage
+        // sum already excludes them — no double-count. is_overhead=0 drops the
+        // job_id=0 overhead receipts. Customer/address joined so a receipt-only
+        // job (no van usage) can still render a full card.
+        const purchases = (await env.DB.prepare(
+          `SELECT pu.id, pu.created_at, pu.job_id, pu.job_number, pu.supplier,
+                  pu.receipt_total AS cost, c.name AS customer,
+                  c.address_street, c.address_city
+             FROM crm_job_purchases pu
+             LEFT JOIN crm_st_jobs j ON j.id = pu.job_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+            WHERE CAST(pu.tech_id AS TEXT)=? AND pu.is_overhead = 0
+              AND substr(pu.created_at,1,10) >= ? AND substr(pu.created_at,1,10) <= ?
+            ORDER BY pu.id DESC LIMIT 500`
+        ).bind(tid, from, to).all()).results || [];
+
         return json({
           tech: tech || { st_tech_id: Number(tid), name: "#" + tid },
           van: van || null, from, to,
-          usage, restocks, requests,
-          totals: { usage: usage.length, restocks: restocks.length, requests: requests.length },
+          usage, restocks, requests, purchases,
+          totals: { usage: usage.length, restocks: restocks.length, requests: requests.length, receipts: purchases.length },
         });
+      }
+
+      // --- 0a-ter. Recent material activity across ALL techs (last N days),
+      // newest-first, for the tech-select landing stream. Same usage+purchases
+      // shapes as the per-tech activity so the client groups both by job with the
+      // identical card. Each row carries its tech name (one chronological stream,
+      // not per-tech sections). GET /api/activity/recent?days=3
+      if (p === "/api/activity/recent" && request.method === "GET") {
+        const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "3", 10) || 3, 1), 31);
+        const since = (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - days); return d.toISOString().slice(0, 10); })();
+        const usage = (await env.DB.prepare(
+          `SELECT m.created_at, m.created_by AS st_tech_id, t.name AS tech_name,
+                  jm.job_id, jm.job_number, c.name AS customer,
+                  c.address_street, c.address_city, jm.total_cost AS cost,
+                  m.material_id, mat.name AS material, ABS(m.qty_change) AS qty
+             FROM crm_inventory_movements m
+             LEFT JOIN crm_job_materials jm ON jm.id = m.reference_id
+             LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+             LEFT JOIN crm_materials mat ON mat.id = m.material_id
+             LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(m.created_by AS TEXT)
+            WHERE m.reason='job_usage' AND substr(m.created_at,1,10) >= ?
+            ORDER BY m.created_at DESC, m.id DESC LIMIT 500`
+        ).bind(since).all()).results || [];
+        const purchases = (await env.DB.prepare(
+          `SELECT pu.id, pu.created_at, pu.tech_id AS st_tech_id, t.name AS tech_name,
+                  pu.job_id, pu.job_number, pu.supplier, pu.receipt_total AS cost,
+                  c.name AS customer, c.address_street, c.address_city
+             FROM crm_job_purchases pu
+             LEFT JOIN crm_st_jobs j ON j.id = pu.job_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+             LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(pu.tech_id AS TEXT)
+            WHERE pu.is_overhead = 0 AND substr(pu.created_at,1,10) >= ?
+            ORDER BY pu.id DESC LIMIT 500`
+        ).bind(since).all()).results || [];
+        return json({ since, days, usage, purchases,
+          totals: { usage: usage.length, purchases: purchases.length } });
       }
 
       // --- 0b. Today's jobs for a tech (ServiceTitan-fed via D1) ----------

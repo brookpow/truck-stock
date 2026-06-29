@@ -177,6 +177,7 @@ function Jobs({ tech, onSignOut }) {
   const [overhead, setOverhead] = useState(false); // off-cycle / overhead purchase (no job)
   const [fromShop, setFromShop] = useState(false); // restock from shop (shop→van transfer)
   const [err, setErr] = useState(false);
+  const [refreshing, setRefreshing] = useState(false); // manual ↻ in-flight
 
   // Load today's jobs. `silent` = a background refresh (poll / regained focus):
   // keep the current list on screen instead of blanking to the spinner, so a tech
@@ -241,7 +242,13 @@ function Jobs({ tech, onSignOut }) {
         <span style={styles.who}>{tech.name}</span>
         <button style={styles.linkBtn} onClick={onSignOut}>Not you?</button>
       </div>
-      <h1 style={styles.h1}>Today's jobs</h1>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <h1 style={styles.h1}>Today's jobs</h1>
+        <button style={styles.linkBtn} disabled={refreshing} title="refresh jobs now"
+          onClick={async () => { setRefreshing(true); try { await loadJobs({ silent: true }); } finally { setRefreshing(false); } }}>
+          {refreshing ? "…" : "↻ refresh"}
+        </button>
+      </div>
 
       {!jobs && !err && <div style={styles.muted}>Loading jobs…</div>}
 

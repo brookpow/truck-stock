@@ -178,16 +178,34 @@ function Jobs({ tech, onSignOut }) {
   const [fromShop, setFromShop] = useState(false); // restock from shop (shop→van transfer)
   const [err, setErr] = useState(false);
 
-  useEffect(() => {
-    setData(null); setErr(false);
-    getTodaysJobs(tech.st_tech_id)
+  // Load today's jobs. `silent` = a background refresh (poll / regained focus):
+  // keep the current list on screen instead of blanking to the spinner, so a tech
+  // mid-task never sees a flash. Only the initial load shows "Loading jobs…".
+  function loadJobs({ silent = false } = {}) {
+    if (!silent) { setData(null); setErr(false); }
+    return getTodaysJobs(tech.st_tech_id)
       .then((r) => {
         const jobs = (r.jobs || []).map(normalizeJob);
         const recent = (r.recent || []).map(normalizeJob);
         setData({ jobs, recent, date: r.date });
-        if (r.fallback === "manual" || jobs.length === 0) setManual(true);
+        if (jobs.length > 0) setManual(false);     // a job appeared → surface it (leave manual mode)
+        else if (!silent) setManual(true);         // initial load, nothing dispatched → manual entry
       })
-      .catch(() => { setData({ jobs: [], recent: [] }); setManual(true); setErr(true); });
+      .catch(() => { if (!silent) { setData({ jobs: [], recent: [] }); setManual(true); setErr(true); } });
+  }
+
+  useEffect(() => { loadJobs(); }, [tech]);
+
+  // Jobs come from the */10 ServiceTitan sync into D1, but the list was only
+  // fetched once at login — so a tech dispatched mid-session had to sign out/in to
+  // see it. Re-fetch SILENTLY when the PWA regains focus (techs background it
+  // between stops and reopen on arrival — the highest-value trigger) and on a
+  // light 60s poll. Mirrors syncQueue's visibility/timer pattern.
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === "visible") loadJobs({ silent: true }); };
+    document.addEventListener("visibilitychange", onVisible);
+    const id = setInterval(() => loadJobs({ silent: true }), 60000);
+    return () => { document.removeEventListener("visibilitychange", onVisible); clearInterval(id); };
   }, [tech]);
 
   function openManual() {

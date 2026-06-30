@@ -533,11 +533,14 @@ export default {
         // lives on that line (job_id + job_number); customer via crm_st_jobs.
         const usage = (await env.DB.prepare(
           `SELECT m.created_at, jm.job_id, jm.job_number, c.name AS customer,
-                  c.address_street, c.address_city, jm.total_cost AS cost,
+                  COALESCE(l.address_street, c.address_street) AS address_street,
+                  COALESCE(l.address_city, c.address_city) AS address_city,
+                  l.name AS location_name, jm.total_cost AS cost,
                   m.material_id, mat.name AS material, ABS(m.qty_change) AS qty
              FROM crm_inventory_movements m
              LEFT JOIN crm_job_materials jm ON jm.id = m.reference_id
              LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
              LEFT JOIN crm_materials mat ON mat.id = m.material_id
             WHERE m.reason='job_usage' AND CAST(m.created_by AS TEXT)=? AND ${dateOK}
@@ -574,9 +577,12 @@ export default {
         const purchases = (await env.DB.prepare(
           `SELECT pu.id, pu.created_at, pu.job_id, pu.job_number, pu.supplier,
                   pu.receipt_total AS cost, c.name AS customer,
-                  c.address_street, c.address_city
+                  COALESCE(l.address_street, c.address_street) AS address_street,
+                  COALESCE(l.address_city, c.address_city) AS address_city,
+                  l.name AS location_name
              FROM crm_job_purchases pu
              LEFT JOIN crm_st_jobs j ON j.id = pu.job_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
             WHERE CAST(pu.tech_id AS TEXT)=? AND pu.is_overhead = 0
               AND substr(pu.created_at,1,10) >= ? AND substr(pu.created_at,1,10) <= ?
@@ -602,11 +608,14 @@ export default {
         const usage = (await env.DB.prepare(
           `SELECT m.created_at, m.created_by AS st_tech_id, t.name AS tech_name,
                   jm.job_id, jm.job_number, c.name AS customer,
-                  c.address_street, c.address_city, jm.total_cost AS cost,
+                  COALESCE(l.address_street, c.address_street) AS address_street,
+                  COALESCE(l.address_city, c.address_city) AS address_city,
+                  l.name AS location_name, jm.total_cost AS cost,
                   m.material_id, mat.name AS material, ABS(m.qty_change) AS qty
              FROM crm_inventory_movements m
              LEFT JOIN crm_job_materials jm ON jm.id = m.reference_id
              LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
              LEFT JOIN crm_materials mat ON mat.id = m.material_id
              LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(m.created_by AS TEXT)
@@ -616,9 +625,13 @@ export default {
         const purchases = (await env.DB.prepare(
           `SELECT pu.id, pu.created_at, pu.tech_id AS st_tech_id, t.name AS tech_name,
                   pu.job_id, pu.job_number, pu.supplier, pu.receipt_total AS cost,
-                  c.name AS customer, c.address_street, c.address_city
+                  c.name AS customer,
+                  COALESCE(l.address_street, c.address_street) AS address_street,
+                  COALESCE(l.address_city, c.address_city) AS address_city,
+                  l.name AS location_name
              FROM crm_job_purchases pu
              LEFT JOIN crm_st_jobs j ON j.id = pu.job_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
              LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(pu.tech_id AS TEXT)
             WHERE pu.is_overhead = 0 AND substr(pu.created_at,1,10) >= ?
@@ -647,14 +660,17 @@ export default {
         const { dayStr, start, end } = pacificDayBoundsUTC();
         const recentStart = new Date(Date.parse(start) - 7 * 86400000)
           .toISOString().replace(/\.\d{3}Z$/, "Z");                 // today's Pacific midnight, -7 days (covers a weekend gap)
+        // Prefer the job's SERVICE-location address (crm_st_locations via
+        // j.location_id); fall back to the customer BILLING address when the
+        // location isn't synced yet (stale locations table — see CRM_BUILD task).
         const addr =
-          `TRIM(COALESCE(c.address_street,'') ||
-                CASE WHEN c.address_city IS NOT NULL THEN ', ' || c.address_city ELSE '' END)`;
+          `TRIM(COALESCE(l.address_street, c.address_street, '') ||
+                CASE WHEN COALESCE(l.address_city, c.address_city) IS NOT NULL THEN ', ' || COALESCE(l.address_city, c.address_city) ELSE '' END)`;
         const [activeRes, recentRes] = await env.DB.batch([
           // ACTIVE — today, active appointment status, job not finished.
           env.DB.prepare(
             `SELECT aa.job_id, j.job_number, j.status AS job_status, c.name AS customer,
-                    ${addr} AS address,
+                    ${addr} AS address, l.name AS location_name,
                     MIN(CASE ap.status WHEN 'Working' THEN 1 WHEN 'Dispatched' THEN 2
                                        WHEN 'Scheduled' THEN 3 ELSE 4 END) AS status_rank,
                     MIN(ap.start_date) AS start_date,
@@ -662,41 +678,44 @@ export default {
                FROM crm_st_appointment_assignments aa
                JOIN crm_st_appointments ap ON ap.id = aa.appointment_id
                JOIN crm_st_jobs j           ON j.id = aa.job_id
+               LEFT JOIN crm_st_locations l ON l.id = j.location_id
                LEFT JOIN crm_st_customers c ON c.id = j.customer_id
               WHERE aa.technician_id = ?1
                 AND ap.status IN ('Working','Dispatched','Scheduled')
                 AND ((ap.start_date >= ?2 AND ap.start_date < ?3) OR ap.status = 'Working')
                 AND j.status NOT IN ('Completed','Canceled')
                 AND LOWER(j.status) != 'paused'
-              GROUP BY aa.job_id, j.job_number, j.status, c.name, c.address_street, c.address_city
+              GROUP BY aa.job_id, j.job_number, j.status, c.name, l.address_street, l.address_city, l.name, c.address_street, c.address_city
               ORDER BY status_rank, start_date`
           ).bind(tid, start, end),
           // RECENT — finished (Completed/paused) jobs visited in the last 3 days.
           env.DB.prepare(
             `SELECT aa.job_id, j.job_number, j.status AS job_status, c.name AS customer,
-                    ${addr} AS address,
+                    ${addr} AS address, l.name AS location_name,
                     MAX(ap.start_date) AS start_date,
                     COUNT(DISTINCT aa.appointment_id) AS appt_count
                FROM crm_st_appointment_assignments aa
                JOIN crm_st_appointments ap ON ap.id = aa.appointment_id
                JOIN crm_st_jobs j           ON j.id = aa.job_id
+               LEFT JOIN crm_st_locations l ON l.id = j.location_id
                LEFT JOIN crm_st_customers c ON c.id = j.customer_id
               WHERE aa.technician_id = ?1
                 AND (j.status = 'Completed' OR LOWER(j.status) = 'paused')
                 AND ap.start_date >= ?2
-              GROUP BY aa.job_id, j.job_number, j.status, c.name, c.address_street, c.address_city
+              GROUP BY aa.job_id, j.job_number, j.status, c.name, l.address_street, l.address_city, l.name, c.address_street, c.address_city
               ORDER BY start_date DESC`
           ).bind(tid, recentStart),
         ]);
         const RANK = { 1: "Working", 2: "Dispatched", 3: "Scheduled" };
         const jobs = (activeRes.results || []).map((row) => ({
           job_id: row.job_id, job_number: row.job_number, customer: row.customer,
-          address: row.address || null, status: RANK[row.status_rank] || "Scheduled",
+          address: row.address || null, location_name: row.location_name || null,
+          status: RANK[row.status_rank] || "Scheduled",
           start_date: row.start_date, appt_count: row.appt_count, job_status: row.job_status,
         }));
         const recent = (recentRes.results || []).map((row) => ({
           job_id: row.job_id, job_number: row.job_number, customer: row.customer,
-          address: row.address || null,
+          address: row.address || null, location_name: row.location_name || null,
           status: String(row.job_status).toLowerCase() === "paused" ? "Paused" : "Done",
           start_date: row.start_date, appt_count: row.appt_count, job_status: row.job_status,
         }));
@@ -1711,11 +1730,14 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const rows = (await env.DB.prepare(
           `SELECT jm.id AS line_id, jm.job_id, jm.material_id, m.name AS material, m.emco_sku,
                   jm.quantity, jm.unit_cost, jm.total_cost, jm.created_at,
-                  j.job_number, j.status AS job_status,
-                  c.name AS customer, c.address_street, c.address_city
+                  j.job_number, j.status AS job_status, c.name AS customer,
+                  COALESCE(l.address_street, c.address_street) AS address_street,
+                  COALESCE(l.address_city, c.address_city) AS address_city,
+                  l.name AS location_name
              FROM crm_job_materials jm
              JOIN crm_materials m ON m.id = jm.material_id
              LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
             WHERE jm.tech_id = ?
               AND jm.created_at > ?
@@ -1736,6 +1758,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
               status: r.job_status,
               customer: r.customer,
               address: [r.address_street, r.address_city].filter(Boolean).join(", ") || null,
+              location_name: r.location_name || null,
               materials: [],
               purchases: [],
             });
@@ -1797,11 +1820,14 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const rows = (await env.DB.prepare(
           `SELECT jm.id AS line_id, jm.job_id, jm.material_id, m.name AS material, m.emco_sku,
                   jm.quantity, jm.unit_cost, jm.total_cost, jm.created_at,
-                  j.job_number, j.status AS job_status,
-                  c.name AS customer, c.address_street, c.address_city
+                  j.job_number, j.status AS job_status, c.name AS customer,
+                  COALESCE(l.address_street, c.address_street) AS address_street,
+                  COALESCE(l.address_city, c.address_city) AS address_city,
+                  l.name AS location_name
              FROM crm_job_materials jm
              JOIN crm_materials m ON m.id = jm.material_id
              LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
             WHERE jm.tech_id = ?
               AND jm.created_at >= datetime('now', ?)
@@ -1820,6 +1846,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
               job_id: r.job_id, job_number: r.job_number, status: r.job_status,
               customer: r.customer,
               address: [r.address_street, r.address_city].filter(Boolean).join(", ") || null,
+              location_name: r.location_name || null,
               materials: [],
             });
           }

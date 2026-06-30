@@ -131,7 +131,7 @@ const STATUS_BADGE = {
 // carrying status + address + start for the list UI.
 const normalizeJob = (j) => ({
   id: j.job_id, num: j.job_number, cust: j.customer,
-  addr: j.address, status: j.status, start: j.start_date,
+  addr: j.address, loc: j.location_name || null, status: j.status, start: j.start_date,
 });
 const fmtTime = (iso) => {
   try {
@@ -143,7 +143,8 @@ const fmtTime = (iso) => {
 
 function JobCard({ job, onTap, current, recent }) {
   const b = STATUS_BADGE[job.status] || STATUS_BADGE.Scheduled;
-  const meta = (job.addr || ("Job " + job.num)) + (job.start ? " · " + fmtTime(job.start) : "");
+  const where = [job.loc, job.addr].filter(Boolean).join(" · ") || ("Job " + job.num);
+  const meta = where + (job.start ? " · " + fmtTime(job.start) : "");
   // On-site job = dark hero card: the one job you're on, readable across a cab.
   if (current) {
     return (

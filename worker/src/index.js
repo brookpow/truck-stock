@@ -205,6 +205,38 @@ async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {})
   return { ok: true, batch_id: batchId, legs_reversed: work.length, reversing_batch: revBatch, warnings, po };
 }
 
+// ── Reorder PO coverage naming ──────────────────────────────────────────────
+// A PO's human label = the window of usage it refills: "since the last order →
+// today". The START date is stamped into po.notes at draft creation (the prior
+// order's date); the END is the PO's sent/received date, or today while it's
+// still a draft. Renders as "Jun 28 – Jul 3" (single day → "Jul 3"; cross-year
+// shows the year).
+const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function poCoverageName(notesStart, endTs) {
+  const s = String(notesStart || "").slice(0, 10);
+  if (!/^\d{4}-\d\d-\d\d$/.test(s)) return null;                 // notes doesn't hold a date → no label
+  const e = String(endTs || "").slice(0, 10) || s;
+  const lbl = (d) => { const [, m, day] = d.split("-").map(Number); return `${MON[m - 1]} ${day}`; };
+  if (s === e) return lbl(s);
+  const sy = s.slice(0, 4), ey = e.slice(0, 4);
+  return sy === ey ? `${lbl(s)} – ${lbl(e)}` : `${lbl(s)} '${sy.slice(2)} – ${lbl(e)} '${ey.slice(2)}`;
+}
+// Label from a PO row (draft end = today). Row needs {notes, sent_at, received_at}.
+function poName(row) {
+  return poCoverageName(row.notes, row.sent_at || row.received_at || new Date().toISOString());
+}
+async function poNameFor(env, poId) {
+  const r = await env.DB.prepare(`SELECT notes, sent_at, received_at FROM crm_inventory_purchase_orders WHERE id=?`).bind(poId).first();
+  return r ? poName(r) : null;
+}
+// The coverage START for a NEW draft = the most recent prior order's date.
+async function reorderCoverStart(env) {
+  const prev = await env.DB.prepare(
+    `SELECT MAX(COALESCE(sent_at, created_at)) AS ts FROM crm_inventory_purchase_orders WHERE status IN ('Sent','Partial','Received')`
+  ).first();
+  return (prev && prev.ts) ? String(prev.ts).slice(0, 10) : new Date().toISOString().slice(0, 10);
+}
+
 function pacificDayBoundsUTC(now = new Date()) {
   const dayStr = new Intl.DateTimeFormat("en-CA", { timeZone: "America/Vancouver" }).format(now);
   const wall = new Intl.DateTimeFormat("en-US", {
@@ -2513,9 +2545,10 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           `SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`
         ).first();
         if (!po) {
+          const coverStart = await reorderCoverStart(env);   // window start = last order's date
           const ins = await env.DB.prepare(
-            `INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by) VALUES (?, 'Draft', ?)`
-          ).bind(b.vendor_name || "EMCO", b.created_by ?? 8).run();
+            `INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by, notes) VALUES (?, 'Draft', ?, ?)`
+          ).bind(b.vendor_name || "EMCO", b.created_by ?? 8, coverStart).run();
           po = { id: ins.meta?.last_row_id };
         }
         const poId = po.id;
@@ -2557,7 +2590,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
             WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
         ).bind(poId).all()).results || [];
-        return json({ ok: true, po_id: poId, status: "Draft", total, lines });
+        return json({ ok: true, po_id: poId, status: "Draft", total, lines, name: await poNameFor(env, poId) });
       }
 
       // 8b-2. POST /api/reorder/po/add-line  { material_id, qty }
@@ -2575,7 +2608,8 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (!mat) return json({ error: "material not found" }, 404);
         let po = await env.DB.prepare(`SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`).first();
         if (!po) {
-          const ins = await env.DB.prepare(`INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by) VALUES ('EMCO','Draft',?)`).bind(b.created_by ?? 8).run();
+          const coverStart = await reorderCoverStart(env);   // window start = last order's date
+          const ins = await env.DB.prepare(`INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by, notes) VALUES ('EMCO','Draft',?,?)`).bind(b.created_by ?? 8, coverStart).run();
           po = { id: ins.meta?.last_row_id };
         }
         const poId = po.id;
@@ -2594,7 +2628,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku, pi.qty_ordered, pi.unit_cost, pi.line_total, pi.source
              FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
         ).bind(poId).all()).results || [];
-        return json({ ok: true, po_id: poId, status: "Draft", total, lines });
+        return json({ ok: true, po_id: poId, status: "Draft", total, lines, name: await poNameFor(env, poId) });
       }
 
       // 8b-3. DELETE /api/reorder/po/line/:lineId — remove ONE line from a DRAFT PO.
@@ -2628,7 +2662,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku, pi.qty_ordered, pi.unit_cost, pi.line_total, pi.source
              FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
         ).bind(poId).all()).results || [];
-        return json({ ok: true, po_id: poId, status: "Draft", total, lines, deleted_line_id: lineId });
+        return json({ ok: true, po_id: poId, status: "Draft", total, lines, deleted_line_id: lineId, name: await poNameFor(env, poId) });
       }
 
       // 8c. POST /api/reorder/po/:id/send — Draft -> Sent, stamp sent_at.
@@ -2718,7 +2752,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
       // 8f. GET /api/reorder/po/current — the open Draft PO with its lines (or null).
       if (p === "/api/reorder/po/current" && request.method === "GET") {
         const po = await env.DB.prepare(
-          `SELECT id, status, total, created_at FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`
+          `SELECT id, status, total, created_at, sent_at, received_at, notes FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`
         ).first();
         if (!po) return json({ po: null });
         const lines = (await env.DB.prepare(
@@ -2726,7 +2760,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
             WHERE pi.po_id=? ORDER BY pi.source DESC, m.name`
         ).bind(po.id).all()).results || [];
-        return json({ po: { ...po, lines } });
+        return json({ po: { ...po, name: poName(po), lines } });
       }
 
       // 8g. GET /api/reorder/pos?status=Sent,Partial — PO list (newest first).
@@ -2735,14 +2769,14 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const arr = status ? status.split(",").map((s) => s.trim()).filter(Boolean) : null;
         const where = arr ? `WHERE status IN (${arr.map(() => "?").join(",")})` : "";
         const stmt = env.DB.prepare(
-          `SELECT po.id, po.status, po.total, po.created_at, po.sent_at, po.received_at,
+          `SELECT po.id, po.status, po.total, po.created_at, po.sent_at, po.received_at, po.notes,
                   (SELECT COUNT(*) FROM crm_inventory_po_items WHERE po_id=po.id) AS line_count,
                   (SELECT COUNT(*) FROM crm_inventory_po_items WHERE po_id=po.id AND qty_received < qty_ordered) AS outstanding_lines
              FROM crm_inventory_purchase_orders po ${where}
             ORDER BY po.id DESC`
         );
         const r = await (arr ? stmt.bind(...arr) : stmt).all();
-        return json({ pos: r.results || [] });
+        return json({ pos: (r.results || []).map((po) => ({ ...po, name: poName(po) })) });
       }
 
       // 8h. GET /api/reorder/po/:id — one PO with ALL its lines (incl. received).
@@ -2750,7 +2784,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
       if (poGetMatch && request.method === "GET") {
         const id = poGetMatch[1];
         const po = await env.DB.prepare(
-          `SELECT id, status, total, created_at, sent_at, received_at FROM crm_inventory_purchase_orders WHERE id=?`
+          `SELECT id, status, total, created_at, sent_at, received_at, notes FROM crm_inventory_purchase_orders WHERE id=?`
         ).bind(id).first();
         if (!po) return json({ error: "not found" }, 404);
         const lines = (await env.DB.prepare(
@@ -2760,7 +2794,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              FROM crm_inventory_po_items pi JOIN crm_materials m ON m.id=pi.material_id
             WHERE pi.po_id=? ORDER BY m.name`
         ).bind(id).all()).results || [];
-        return json({ po: { ...po, lines } });
+        return json({ po: { ...po, name: poName(po), lines } });
       }
 
       // 8e. GET /api/reorder/backorders — outstanding lines on Sent/Partial POs.

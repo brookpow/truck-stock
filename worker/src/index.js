@@ -575,7 +575,7 @@ export default {
              LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
              LEFT JOIN crm_materials mat ON mat.id = m.material_id
-            WHERE m.reason='job_usage' AND CAST(m.created_by AS TEXT)=? AND ${dateOK}
+            WHERE m.reason='job_usage' AND jm.id IS NOT NULL AND CAST(m.created_by AS TEXT)=? AND ${dateOK}
             ORDER BY m.created_at DESC, m.id DESC LIMIT 500`
         ).bind(tid, from, to).all()).results || [];
 
@@ -651,7 +651,7 @@ export default {
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
              LEFT JOIN crm_materials mat ON mat.id = m.material_id
              LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(m.created_by AS TEXT)
-            WHERE m.reason='job_usage' AND substr(m.created_at,1,10) >= ?
+            WHERE m.reason='job_usage' AND jm.id IS NOT NULL AND substr(m.created_at,1,10) >= ?
             ORDER BY m.created_at DESC, m.id DESC LIMIT 500`
         ).bind(since).all()).results || [];
         const purchases = (await env.DB.prepare(

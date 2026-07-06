@@ -573,22 +573,28 @@ export default {
         const tech = await env.DB.prepare(`SELECT st_tech_id, name FROM crm_techs WHERE st_tech_id = ?`).bind(tid).first();
         const van = await env.DB.prepare(`SELECT id, name FROM crm_inventory_locations WHERE type='truck' AND assigned_tech_id = ? ORDER BY active DESC LIMIT 1`).bind(tid).first();
 
-        // job_usage.reference_id = crm_job_materials.id (the logged line) — the job
-        // lives on that line (job_id + job_number); customer via crm_st_jobs.
+        // Source of truth = the logged LINE (crm_job_materials), same as GP + the
+        // tech app — NOT the job_usage movement. This gives current jm.quantity
+        // (movement qty is only the first log, stale after qty-edits) AND includes
+        // cost-only items (per-foot pipe writes no movement). Deleted lines are
+        // gone from crm_job_materials → excluded naturally (no phantom filter).
+        // Receipt-matched lines are tagged and excluded (they render under
+        // receipts, not double-counted as van materials).
         const usage = (await env.DB.prepare(
-          `SELECT m.created_at, jm.job_id, jm.job_number, c.name AS customer,
+          `SELECT jm.created_at, jm.job_id, jm.job_number, c.name AS customer,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name, jm.total_cost AS cost,
-                  m.material_id, mat.name AS material, ABS(m.qty_change) AS qty
-             FROM crm_inventory_movements m
-             LEFT JOIN crm_job_materials jm ON jm.id = m.reference_id
+                  jm.material_id, mat.name AS material, jm.quantity AS qty
+             FROM crm_job_materials jm
              LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
              LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
-             LEFT JOIN crm_materials mat ON mat.id = m.material_id
-            WHERE m.reason='job_usage' AND jm.id IS NOT NULL AND CAST(m.created_by AS TEXT)=? AND ${dateOK}
-            ORDER BY m.created_at DESC, m.id DESC LIMIT 500`
+             LEFT JOIN crm_materials mat ON mat.id = jm.material_id
+            WHERE CAST(jm.tech_id AS TEXT)=?
+              AND (jm.notes IS NULL OR jm.notes NOT LIKE '${RECEIPT_TAG_PREFIX}%')
+              AND substr(jm.created_at,1,10) >= ? AND substr(jm.created_at,1,10) <= ?
+            ORDER BY jm.created_at DESC, jm.id DESC LIMIT 500`
         ).bind(tid, from, to).all()).results || [];
 
         const restocks = van ? (await env.DB.prepare(
@@ -649,22 +655,25 @@ export default {
       if (p === "/api/activity/recent" && request.method === "GET") {
         const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "3", 10) || 3, 1), 31);
         const since = (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - days); return d.toISOString().slice(0, 10); })();
+        // jm-driven (see per-tech usage above): current qty from jm.quantity,
+        // includes cost-only items, excludes deleted (gone) + receipt-matched
+        // (tagged) lines. tech from jm.tech_id (= the logging tech).
         const usage = (await env.DB.prepare(
-          `SELECT m.created_at, m.created_by AS st_tech_id, t.name AS tech_name,
+          `SELECT jm.created_at, jm.tech_id AS st_tech_id, t.name AS tech_name,
                   jm.job_id, jm.job_number, c.name AS customer,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name, jm.total_cost AS cost,
-                  m.material_id, mat.name AS material, ABS(m.qty_change) AS qty
-             FROM crm_inventory_movements m
-             LEFT JOIN crm_job_materials jm ON jm.id = m.reference_id
+                  jm.material_id, mat.name AS material, jm.quantity AS qty
+             FROM crm_job_materials jm
              LEFT JOIN crm_st_jobs j ON j.id = jm.job_id
              LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
-             LEFT JOIN crm_materials mat ON mat.id = m.material_id
-             LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(m.created_by AS TEXT)
-            WHERE m.reason='job_usage' AND jm.id IS NOT NULL AND substr(m.created_at,1,10) >= ?
-            ORDER BY m.created_at DESC, m.id DESC LIMIT 500`
+             LEFT JOIN crm_materials mat ON mat.id = jm.material_id
+             LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(jm.tech_id AS TEXT)
+            WHERE (jm.notes IS NULL OR jm.notes NOT LIKE '${RECEIPT_TAG_PREFIX}%')
+              AND substr(jm.created_at,1,10) >= ?
+            ORDER BY jm.created_at DESC, jm.id DESC LIMIT 500`
         ).bind(since).all()).results || [];
         const purchases = (await env.DB.prepare(
           `SELECT pu.id, pu.created_at, pu.tech_id AS st_tech_id, t.name AS tech_name,

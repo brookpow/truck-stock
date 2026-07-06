@@ -546,6 +546,18 @@ export default {
         return json(r.results || []);
       }
 
+      // --- 0a-quater. Office people for the "who's at the keyboard?" picker.
+      // Active admins only (Brook, Jen). Retired placeholders (dup Jen id 3,
+      // Warehouse Manager id 8) are is_active=0 so they drop off but old
+      // created_by rows still resolve. GET /api/office-users
+      if (p === "/api/office-users" && request.method === "GET") {
+        const r = await env.DB.prepare(
+          `SELECT id, TRIM(COALESCE(first_name,'') || ' ' || COALESCE(last_name,'')) AS name
+             FROM crm_users WHERE role='admin' AND is_active=1 ORDER BY id`
+        ).all();
+        return json({ users: r.results || [] });
+      }
+
       // --- 0a-bis. Per-plumber activity (read-only reporting, surfaces existing
       // data). GET /api/techs/:stTechId/activity?from=YYYY-MM-DD&to=YYYY-MM-DD ->
       //   usage:    van stock used on jobs (job_usage, created_by = this plumber)
@@ -1046,6 +1058,8 @@ export default {
       if (delMatch && request.method === "DELETE") {
         const jobId = delMatch[1];
         const lineId = delMatch[2];
+        const delBody = await request.json().catch(() => ({}));
+        const actorId = delBody.actor_id ?? null;   // WHO deleted (tech or office person) — distinct from the line's original tech
         // Fetch the columns we need both for the scope check AND to reverse the
         // stock deduction symmetrically (material_id, quantity, tech_id).
         const row = await env.DB.prepare(
@@ -1111,8 +1125,8 @@ export default {
                 ).bind(after, srow.id),
                 env.DB.prepare(
                   `INSERT INTO crm_inventory_movements
-                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
-                   VALUES (?,?,?,?,?,?,?)`
+                     (material_id, location_id, qty_change, reason, reference_id, notes, created_by, actor_id)
+                   VALUES (?,?,?,?,?,?,?,?)`
                 ).bind(
                   row.material_id,
                   locId,                 // the ORIGINAL deduction's location
@@ -1120,7 +1134,8 @@ export default {
                   "manual",
                   row.id,                // reference back to the deleted line id
                   `usage_reversed; line ${row.id}`,
-                  row.tech_id ?? null
+                  row.tech_id ?? null,   // created_by stays the ORIGINAL tech (unchanged)
+                  actorId                // actor_id = WHO performed the delete
                 ),
               ]);
               stock = {
@@ -1152,6 +1167,7 @@ export default {
         const lineId = delMatch[2];
         const b = await request.json();
         const newQty = Number(b.quantity);
+        const actorId = b.actor_id ?? null;   // WHO edited — distinct from the line's original tech
         if (!(newQty > 0)) {
           return json({ error: "quantity must be > 0 (use DELETE to remove)" }, 400);
         }
@@ -1209,11 +1225,11 @@ export default {
                   ).bind(after, srow.id),
                   env.DB.prepare(
                     `INSERT INTO crm_inventory_movements
-                       (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
-                     VALUES (?,?,?,?,?,?,?)`
+                       (material_id, location_id, qty_change, reason, reference_id, notes, created_by, actor_id)
+                     VALUES (?,?,?,?,?,?,?,?)`
                   ).bind(
                     row.material_id, locId, -delta, "manual", row.id,
-                    `qty edit: line ${row.id} ${oldQty}->${newQty}`, row.tech_id ?? null
+                    `qty edit: line ${row.id} ${oldQty}->${newQty}`, row.tech_id ?? null, actorId
                   ),
                 ]);
                 stock = {

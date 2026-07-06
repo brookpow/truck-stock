@@ -175,7 +175,7 @@ function Jobs({ tech, onSignOut }) {
   const [manual, setManual] = useState(false);
   const [manualId, setManualId] = useState("");
   const [active, setActive] = useState(null); // selected job
-  const [overhead, setOverhead] = useState(false); // off-cycle / overhead purchase (no job)
+  const [scanOpen, setScanOpen] = useState(false); // home-screen receipt scan (destination chosen after scan)
   const [fromShop, setFromShop] = useState(false); // restock from shop (shop→van transfer)
   const [err, setErr] = useState(false);
   const [refreshing, setRefreshing] = useState(false); // manual ↻ in-flight
@@ -222,11 +222,11 @@ function Jobs({ tech, onSignOut }) {
   if (active) {
     return <Capture tech={tech} job={active} onBack={() => setActive(null)} />;
   }
-  if (overhead) {
-    // No job: a pseudo-job flagged overhead. ReceiptScan routes the save to
-    // /api/overhead/purchases and logs no matched materials.
-    return <ReceiptScan tech={tech} job={{ id: 0, num: "off-cycle", cust: "Off-cycle purchase", overhead: true }}
-      onDone={() => setOverhead(false)} onCancel={() => setOverhead(false)} />;
+  if (scanOpen) {
+    // Home scan: destination (a job vs shop/overhead) is chosen AFTER the scan.
+    // Pass the loaded jobs feed so the picker can list this tech's recent jobs.
+    return <ReceiptScan tech={tech} jobsData={data}
+      onDone={() => { setScanOpen(false); loadJobs({ silent: true }); }} onCancel={() => setScanOpen(false)} />;
   }
   if (fromShop) {
     return <FromShopRestock tech={tech} onBack={() => setFromShop(false)} />;
@@ -270,15 +270,15 @@ function Jobs({ tech, onSignOut }) {
       )}
       {err && <div style={styles.error}>Couldn't load today's jobs — enter the job number below.</div>}
 
-      {/* Off-cycle / overhead purchase — a receipt with no job (consumables, shop
-          supplies). Reuses the scanner; writes an overhead-flagged purchase. */}
-      <button style={styles.actRow} className="fm-press" onClick={() => setOverhead(true)}>
-        <span style={{ ...styles.actIco, color: C.amberInk, background: C.amberWash }}>
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 3h11l3 3v15H5z" /><path d="M9 8h6M9 12h6M9 16h4" /></svg>
+      {/* Scan a receipt — one tap from home. The tech confirms the scan, then
+          picks a destination (a job, or shop/overhead) — no silent bucket. */}
+      <button style={styles.actRow} className="fm-press" onClick={() => setScanOpen(true)}>
+        <span style={{ ...styles.actIco, color: C.blueInk, background: C.blueWash }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" /><circle cx="12" cy="13" r="4" /></svg>
         </span>
         <span style={styles.actText}>
-          <span style={styles.actTitle}>Off-cycle purchase</span>
-          <span style={styles.actDesc}>A receipt that's not for a job</span>
+          <span style={styles.actTitle}>📷 Scan a receipt</span>
+          <span style={styles.actDesc}>supplier purchase — packing slip or delivery note</span>
         </span>
       </button>
       <button style={styles.actRow} className="fm-press" onClick={() => setFromShop(true)}>
@@ -818,8 +818,13 @@ function fileToScaledBase64(file, maxDim = 1600, quality = 0.92) {
 // Photograph a receipt, the worker's vision endpoint extracts supplier + line
 // items + catalog matches (writes nothing), the tech confirms/edits which lines
 // to log, then we POST to /purchases (writes the receipt; NO van deduction).
-function ReceiptScan({ tech, job, onDone, onCancel }) {
-  const [phase, setPhase] = useState("capture"); // capture | scanning | review | saving
+function ReceiptScan({ tech, job = null, jobsData = null, onDone, onCancel }) {
+  const preAnswered = !!(job && job.id);   // in-job scan → destination is that job (skip the choice)
+  const [phase, setPhase] = useState("capture"); // capture|scanning|review|failed|destination|jobpick|saving
+  const [dest, setDest] = useState(() => (preAnswered ? { kind: "job", job } : null));
+  const [pendingAction, setPendingAction] = useState(null); // 'full'|'photo' — run once destination is picked
+  const [jobQuery, setJobQuery] = useState("");
+  const [manualNum, setManualNum] = useState("");
   const [err, setErr] = useState(null);
   const [supplier, setSupplier] = useState("");
   const [subtotal, setSubtotal] = useState("");
@@ -842,7 +847,7 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
     try {
       const { base64, mediaType } = await fileToScaledBase64(file);
       setImgB64(base64); setImgMedia(mediaType);   // keep it to store on save (no second photo)
-      const r = await scanReceipt(job.id, base64, mediaType);
+      const r = await scanReceipt(preAnswered ? job.id : 0, base64, mediaType);
       setSupplier(r.supplier || "");
       // The worker already computed subtotal/total per the wholesaler rules
       // (tax-included slips kept as-is; packing slips taxed at 12%). Use them
@@ -876,10 +881,22 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
     setPhase("review");
   }
 
-  async function save() {
+  // Home path: pick a destination AFTER the scan, then run the pending action.
+  // In-job path: destination is pre-answered → run immediately, no extra step.
+  function beginSave(action) {                 // action: 'full' | 'photo'
+    if (preAnswered) { (action === "photo" ? savePhotoOnly : save)(dest); return; }
+    setPendingAction(action); setPhase("destination");
+  }
+  function runAfterDest(chosen) { setDest(chosen); (pendingAction === "photo" ? savePhotoOnly : save)(chosen); }
+
+  // Destination-aware save. `chosen` = { kind:'job', job } | { kind:'overhead' }.
+  // Job → savePurchase (attaches + logs matched lines); overhead → is_overhead=1,
+  // no matched lines. Nothing is written until a door is explicitly chosen.
+  async function save(chosen) {
     const t = Number(total);
     if (!supplier.trim()) { alert("Enter the supplier."); return; }
     if (!(t > 0)) { alert("Enter the receipt total."); return; }
+    const overhead = chosen.kind === "overhead";
     setPhase("saving");
     try {
       const body = {
@@ -891,8 +908,8 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
         image_base64: imgB64 || undefined,   // store the receipt photo in R2 (reuses the scan image)
         media_type: imgMedia,
         description: lines.map((l) => l.description).filter(Boolean).slice(0, 4).join(", "),
-        // Overhead has NO job, so it logs NO matched materials.
-        items: job.overhead ? [] : lines.map((l) => ({
+        // A job receipt logs its matched lines; overhead logs none.
+        items: overhead ? [] : lines.map((l) => ({
           description: l.description,
           quantity: Number(l.quantity) || 1,
           unit_cost: Number(l.unit_cost) || 0,
@@ -901,7 +918,7 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
           log_to_materials: l.match ? !!l.log : false,
         })),
       };
-      const res = job.overhead ? await saveOverheadPurchase(body) : await savePurchase(job.id, body);
+      const res = overhead ? await saveOverheadPurchase(body) : await savePurchase(chosen.job.id, body);
       onDone(res);
     } catch (e) {
       alert("Couldn't save: " + (e.message || e));
@@ -913,8 +930,9 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
   // now with a $0 placeholder so the office reads the image and adds the costs
   // later (Receipts screen → edit). The worker accepts a $0 receipt; the photo
   // still goes to R2.
-  async function savePhotoOnly() {
+  async function savePhotoOnly(chosen) {
     if (!imgB64) { alert("No photo captured yet — retake it."); return; }
+    const overhead = chosen.kind === "overhead";
     setPhase("saving");
     try {
       const body = {
@@ -925,7 +943,7 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
         description: "Scan failed — photo saved; office to add costs from the receipt.",
         items: [],
       };
-      const res = job.overhead ? await saveOverheadPurchase(body) : await savePurchase(job.id, body);
+      const res = overhead ? await saveOverheadPurchase(body) : await savePurchase(chosen.job.id, body);
       onDone(res);
     } catch (e) {
       alert("Couldn't upload the photo: " + (e.message || e));
@@ -937,10 +955,9 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
     <div style={styles.screen}>
       <div style={styles.topbar}>
         <button style={styles.linkBtn} onClick={onCancel}>← cancel</button>
-        <span style={styles.who}>{job.overhead ? "🧰 Off-cycle purchase" : "Receipt · " + (job.cust || job.num)}</span>
+        <span style={styles.who}>{preAnswered ? "Receipt · " + (job.cust || job.num) : "Scan a receipt"}</span>
       </div>
-      <h1 style={styles.h1}>{job.overhead ? "Off-cycle / overhead purchase" : "Scan a receipt"}</h1>
-      {job.overhead && <div style={styles.overheadNote}>Recorded as <b>overhead / consumables</b> — not tied to a job, and touches no inventory (no van deduction, no job materials).</div>}
+      <h1 style={styles.h1}>Scan a receipt</h1>
 
       {err && <div style={styles.error}>{err}</div>}
 
@@ -960,9 +977,57 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
         <div style={styles.failBox}>
           <div style={styles.failTitle}>Couldn't scan the receipt</div>
           <p style={styles.sub}>The scanner's busy or couldn't read it — but your photo is fine. Upload just the photo and the office adds the costs, enter the costs by hand, or re-scan.</p>
-          {imgB64 && <button style={styles.primary} onClick={savePhotoOnly}>📷 Upload photo only — office adds the costs</button>}
+          {imgB64 && <button style={styles.primary} onClick={() => beginSave("photo")}>📷 Upload photo only — office adds the costs</button>}
           <button style={styles.scanBtn} onClick={startManual}>Enter the costs by hand</button>
           <button style={styles.scanBtn} onClick={() => setPhase("capture")}>↻ Try the scan again</button>
+        </div>
+      )}
+
+      {phase === "destination" && (
+        <div>
+          <p style={styles.sub}>Where does this receipt go?</p>
+          <button style={styles.destDoor} className="fm-press" onClick={() => setPhase("jobpick")}>
+            <span style={styles.destTitle}>🧾 For a job</span>
+            <span style={styles.destDesc}>Attach to the customer's job — counts toward its materials &amp; cost</span>
+          </button>
+          <button style={styles.destDoor} className="fm-press" onClick={() => runAfterDest({ kind: "overhead" })}>
+            <span style={styles.destTitle}>🏬 Shop &amp; consumables (overhead)</span>
+            <span style={styles.destDesc}>Rags, bits, shop supplies (overhead) — not for a customer's job</span>
+          </button>
+          <button style={styles.scanBtn} onClick={onCancel}>✕ Discard scan</button>
+        </div>
+      )}
+
+      {phase === "jobpick" && (
+        <div>
+          <button style={styles.linkBtn} onClick={() => setPhase("destination")}>← back</button>
+          <p style={styles.sub}>Which job is this receipt for?</p>
+          <input style={styles.input} placeholder="Search customer / address…" value={jobQuery} onChange={(e) => setJobQuery(e.target.value)} />
+          {(() => {
+            const q = jobQuery.trim().toLowerCase();
+            const match = (j) => !q || `${j.cust || ""} ${j.loc || ""} ${j.addr || ""} ${j.num || ""}`.toLowerCase().includes(q);
+            const today = ((jobsData && jobsData.jobs) || []).filter(match);
+            const recent = ((jobsData && jobsData.recent) || []).filter(match);
+            const row = (j) => (
+              <button key={j.id} style={styles.jobPickRow} className="fm-press" onClick={() => runAfterDest({ kind: "job", job: j })}>
+                <span style={styles.jobPickCust}>{j.cust || ("Job " + j.num)}</span>
+                <span style={styles.muted}>{[j.loc || j.addr, j.num ? "#" + j.num : null].filter(Boolean).join(" · ")}</span>
+              </button>
+            );
+            return (
+              <>
+                {today.length > 0 && <div style={styles.sectionLabel}>Today</div>}
+                {today.map(row)}
+                {recent.length > 0 && <div style={styles.sectionLabel}>Recent</div>}
+                {recent.map(row)}
+                {today.length === 0 && recent.length === 0 && <div style={styles.muted}>No matching jobs — enter the number below.</div>}
+              </>
+            );
+          })()}
+          <div style={styles.manualPickRow}>
+            <input style={{ ...styles.input, flex: 1, marginBottom: 0 }} inputMode="numeric" placeholder="…or enter a job number" value={manualNum} onChange={(e) => setManualNum(e.target.value.replace(/\D/g, ""))} />
+            <button style={styles.primarySm} disabled={!manualNum} onClick={() => runAfterDest({ kind: "job", job: { id: Number(manualNum), num: manualNum, cust: "Job " + manualNum } })}>Use</button>
+          </div>
         </div>
       )}
 
@@ -1011,10 +1076,10 @@ function ReceiptScan({ tech, job, onDone, onCancel }) {
             </div>
           </div>
 
-          <button style={styles.primary} disabled={phase === "saving"} onClick={save}>
-            {phase === "saving" ? "Saving…" : "Save purchase"}
+          <button style={styles.primary} disabled={phase === "saving"} onClick={() => beginSave("full")}>
+            {phase === "saving" ? "Saving…" : (preAnswered ? "Save to this job" : "Save →")}
           </button>
-          {imgB64 && <button style={styles.scanBtn} disabled={phase === "saving"} onClick={savePhotoOnly}>📷 Or just save the photo — add the costs in the office</button>}
+          {imgB64 && <button style={styles.scanBtn} disabled={phase === "saving"} onClick={() => beginSave("photo")}>📷 Or just save the photo — add the costs in the office</button>}
           <button style={styles.scanBtn} onClick={() => setPhase("capture")}>↺ retake photo</button>
         </>
       )}
@@ -1189,6 +1254,14 @@ const styles = {
   input: { ...ctl, width: "100%", height: 52, fontSize: 16, padding: "0 14px", marginBottom: 10 },
   primary: { width: "100%", height: 52, fontSize: 16, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer" },
   scanBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
+  primarySm: { height: 52, padding: "0 18px", fontSize: 15, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer", whiteSpace: "nowrap" },
+  // Receipt destination doors (chosen after the scan — no silent default).
+  destDoor: { ...card, display: "flex", flexDirection: "column", gap: 3, width: "100%", textAlign: "left", cursor: "pointer", padding: "16px", borderRadius: 16, marginBottom: 12, border: `1px solid ${C.hair}` },
+  destTitle: { fontFamily: DISP, fontSize: 17, fontWeight: 700, letterSpacing: "-.02em", color: C.ink },
+  destDesc: { fontSize: 13, color: C.ink3 },
+  jobPickRow: { ...card, display: "flex", flexDirection: "column", gap: 2, width: "100%", textAlign: "left", cursor: "pointer", padding: "13px 15px", borderRadius: 14, marginBottom: 8 },
+  jobPickCust: { fontFamily: DISP, fontWeight: 700, fontSize: 15.5, letterSpacing: "-.01em", color: C.ink },
+  manualPickRow: { display: "flex", gap: 8, alignItems: "center", marginTop: 14 },
   rcptLine: { ...card, borderRadius: 14, padding: "10px 12px", marginBottom: 8 },
   rcptDesc: { ...ctl, width: "100%", height: 40, fontSize: 15, padding: "0 10px", marginBottom: 6 },
   rcptRow2: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },

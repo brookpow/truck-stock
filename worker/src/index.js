@@ -2524,7 +2524,10 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
                   ), 0) AS already_on_order
              FROM crm_inventory_stock s
              JOIN crm_materials m ON m.id = s.material_id
-            WHERE s.location_id = 1 AND s.on_hand < s.max_qty AND m.is_active = 1
+            -- Trigger at the reorder point (below MIN), fill to max — so editing a
+            -- MAX no longer auto-injects items sitting between min and max into the
+            -- active reorder. Genuine depletion below min still surfaces.
+            WHERE s.location_id = 1 AND s.on_hand < s.min_qty AND m.is_active = 1
               AND m.deduct_on_use = 1   -- cost-only items (pipe, untracked bag) are reordered manually
               -- Hide items dismissed from the reorder, UNTIL the shop row changes
               -- again (a count/receipt bumps modified_at past the dismiss). A

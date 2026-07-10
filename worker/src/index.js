@@ -222,8 +222,10 @@ function poCoverageName(notesStart, endTs) {
   return sy === ey ? `${lbl(s)} – ${lbl(e)}` : `${lbl(s)} '${sy.slice(2)} – ${lbl(e)} '${ey.slice(2)}`;
 }
 // Label from a PO row (draft end = today). Row needs {notes, sent_at, received_at}.
+// Count-driven orders store a human name in notes (e.g. "shop re-count (Jul 6)")
+// which isn't a coverage date → fall back to the notes string verbatim.
 function poName(row) {
-  return poCoverageName(row.notes, row.sent_at || row.received_at || new Date().toISOString());
+  return poCoverageName(row.notes, row.sent_at || row.received_at || new Date().toISOString()) || (row.notes || null);
 }
 async function poNameFor(env, poId) {
   const r = await env.DB.prepare(`SELECT notes, sent_at, received_at FROM crm_inventory_purchase_orders WHERE id=?`).bind(poId).first();
@@ -274,8 +276,10 @@ async function getLocationStock(env, locationId) {
 //     in the same batch so stock + ledger never diverge.
 //   min_qty/max_qty provided -> updated directly (thresholds are settings, not
 //     stock movements — NO movement row).
-// `note` labels the movement (e.g. "van count" / "shop count").
-async function saveLocationStock(env, locationId, items, operator, note) {
+// `note` labels the movement (e.g. "van count" / "shop count"). opts.referenceId
+// + opts.actorId tag count_adjust movements to a count session + its counter.
+async function saveLocationStock(env, locationId, items, operator, note, opts = {}) {
+  const { referenceId = null, actorId = null } = opts;
   const num = (v) => (v != null && v !== "" ? Number(v) : undefined);
   const results = [];
   for (const it of items) {
@@ -318,9 +322,9 @@ async function saveLocationStock(env, locationId, items, operator, note) {
           upd,
           env.DB.prepare(
             `INSERT INTO crm_inventory_movements
-               (material_id, location_id, qty_change, reason, reference_id, notes, created_by)
-             VALUES (?,?,?,?,?,?,?)`
-          ).bind(mid, locationId, delta, "count_adjust", null, note, operator),
+               (material_id, location_id, qty_change, reason, reference_id, notes, created_by, actor_id)
+             VALUES (?,?,?,?,?,?,?,?)`
+          ).bind(mid, locationId, delta, "count_adjust", referenceId, note, operator, actorId),
         ]);
       } else {
         await upd.run();
@@ -2541,6 +2545,211 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         return json({ items });
       }
 
+      // ===== 9. Cycle counts (Change D — Start Count) ======================
+      // A deliberate count session that snapshots a location's stock list, takes
+      // counted quantities (partial save/resume), then on finish writes the
+      // count_adjust movements and generates a NAMED, count-driven order (slice 2).
+      // Reuses crm_inventory_counts + crm_inventory_count_items (existing tables).
+
+      // 9a. POST /api/counts { location_id, actor_id } — start a session + snapshot.
+      //   Refuses a 2nd open session per location. expected_qty = current on_hand.
+      if (p === "/api/counts" && request.method === "POST") {
+        const b = await request.json().catch(() => ({}));
+        let locationId = b.location_id;
+        if (locationId == null && b.tech_id != null) {   // tech app counts ITS OWN van — resolve by tech
+          const van = await env.DB.prepare(`SELECT id FROM crm_inventory_locations WHERE type='truck' AND assigned_tech_id = ? ORDER BY active DESC LIMIT 1`).bind(b.tech_id).first();
+          if (van) locationId = van.id;
+        }
+        const actorId = b.actor_id ?? null;
+        const scope = b.scope === "categories" ? "categories" : "full";        // full | spot check (categories)
+        const categories = Array.isArray(b.categories) ? b.categories.filter(Boolean) : [];
+        if (locationId == null) return json({ error: "location_id required" }, 400);
+        if (scope === "categories" && categories.length === 0) return json({ error: "categories required for a spot check" }, 400);
+        const loc = await env.DB.prepare(`SELECT id, type, name, assigned_tech_id FROM crm_inventory_locations WHERE id=?`).bind(locationId).first();
+        if (!loc) return json({ error: "location not found" }, 404);
+        const open = await env.DB.prepare(`SELECT id FROM crm_inventory_counts WHERE location_id=? AND status='InProgress' ORDER BY id DESC LIMIT 1`).bind(locationId).first();
+        if (open) return json({ error: "count_in_progress", count_id: open.id }, 409);
+        // Snapshot the location's stock list (min/max items only). A SPOT CHECK
+        // narrows to the chosen categories — same machinery, smaller scope.
+        let stock = (await getLocationStock(env, locationId)).filter((s) => (s.max_qty || 0) > 0 || (s.min_qty || 0) > 0);   // min/max items only (skip 0/0/0 non-stocked rows)
+        if (scope === "categories") stock = stock.filter((s) => categories.includes(s.category));
+        if (stock.length === 0) return json({ error: "nothing_to_count", detail: scope === "categories" ? "no stocked items in those categories" : "location has no stock list" }, 400);
+        const scopeDetail = scope === "categories" ? JSON.stringify(categories) : null;
+        const ins = await env.DB.prepare(`INSERT INTO crm_inventory_counts (location_id, status, created_by, scope, scope_detail) VALUES (?, 'InProgress', ?, ?, ?)`).bind(locationId, actorId, scope, scopeDetail).run();
+        const countId = ins.meta?.last_row_id;
+        const stmts = stock.map((s) => env.DB.prepare(
+          `INSERT INTO crm_inventory_count_items (count_id, material_id, expected_qty, actual_qty, variance) VALUES (?,?,?,NULL,NULL)`
+        ).bind(countId, s.material_id, s.on_hand ?? 0));
+        for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+        return json({
+          count_id: countId, location_id: Number(locationId), location_name: loc.name, type: loc.type, scope, categories,
+          items: stock.map((s) => ({ material_id: s.material_id, name: s.name, emco_sku: s.emco_sku, category: s.category, expected_qty: s.on_hand ?? 0, min_qty: s.min_qty, max_qty: s.max_qty, actual_qty: null })),
+        });
+      }
+
+      // 9b. GET /api/counts/current?location_id= — the open session + items (resume).
+      if (p === "/api/counts/current" && request.method === "GET") {
+        let locationId = url.searchParams.get("location_id");
+        const techId = url.searchParams.get("tech_id");
+        if (!locationId && techId) {
+          const van = await env.DB.prepare(`SELECT id FROM crm_inventory_locations WHERE type='truck' AND assigned_tech_id = ? ORDER BY active DESC LIMIT 1`).bind(techId).first();
+          if (van) locationId = van.id;
+        }
+        if (!locationId) return json({ error: "location_id or tech_id required" }, 400);
+        const cnt = await env.DB.prepare(`SELECT id, location_id, status, created_by, created_at, completed_at, scope, scope_detail FROM crm_inventory_counts WHERE location_id=? AND status='InProgress' ORDER BY id DESC LIMIT 1`).bind(locationId).first();
+        if (!cnt) return json({ count: null });
+        const items = (await env.DB.prepare(
+          `SELECT ci.material_id, m.name, m.emco_sku, m.category, ci.expected_qty, ci.actual_qty,
+                  s.on_hand AS current_on_hand, s.min_qty, s.max_qty
+             FROM crm_inventory_count_items ci
+             JOIN crm_materials m ON m.id = ci.material_id
+             LEFT JOIN crm_inventory_stock s ON s.location_id = ? AND s.material_id = ci.material_id
+            WHERE ci.count_id = ? ORDER BY m.category, m.name`
+        ).bind(locationId, cnt.id).all()).results || [];
+        return json({ count: { ...cnt, items } });
+      }
+
+      // 9c. PATCH /api/counts/:id/items { items:[{material_id, actual_qty}] } — partial save.
+      //   actual_qty null/'' clears a count; variance = actual − expected.
+      const countItemsMatch = p.match(/^\/api\/counts\/(\d+)\/items$/);
+      if (countItemsMatch && request.method === "PATCH") {
+        const countId = countItemsMatch[1];
+        const b = await request.json().catch(() => ({}));
+        const items = Array.isArray(b.items) ? b.items : [];
+        const stmts = [];
+        for (const it of items) {
+          if (it.material_id == null) continue;
+          const actual = (it.actual_qty === "" || it.actual_qty == null) ? null : Number(it.actual_qty);
+          if (actual != null && !Number.isFinite(actual)) continue;
+          stmts.push(env.DB.prepare(
+            `UPDATE crm_inventory_count_items
+                SET actual_qty = ?1, variance = (CASE WHEN ?1 IS NULL THEN NULL ELSE ?1 - expected_qty END)
+              WHERE count_id = ?2 AND material_id = ?3`
+          ).bind(actual, countId, it.material_id));
+        }
+        for (let i = 0; i < stmts.length; i += 50) await env.DB.batch(stmts.slice(i, i + 50));
+        return json({ ok: true, saved: stmts.length });
+      }
+
+      // 9d. POST /api/counts/:id/finish { actor_id } — apply the count + generate
+      //   a NAMED, editable, count-driven order. IDEMPOTENT: the atomic
+      //   in_progress→completed flip is the gate — a double-tap / retry / second
+      //   device sees changes=0 and no-ops (no double count_adjust, no 2nd order).
+      //   Zero post-count shortfall → NO order (no empty artifact). Shortfall =
+      //   below MIN, fill to MAX (decouple semantics).
+      const countFinishMatch = p.match(/^\/api\/counts\/(\d+)\/finish$/);
+      if (countFinishMatch && request.method === "POST") {
+        const countId = countFinishMatch[1];
+        const b = await request.json().catch(() => ({}));
+        const actorId = b.actor_id ?? null;
+        const cnt = await env.DB.prepare(`SELECT id, location_id, status, created_at, scope, scope_detail FROM crm_inventory_counts WHERE id=?`).bind(countId).first();
+        if (!cnt) return json({ error: "count not found" }, 404);
+
+        // --- Idempotency gate: only ONE finish flips in_progress -> completed ---
+        const gate = await env.DB.prepare(
+          `UPDATE crm_inventory_counts SET status='Completed', completed_at=datetime('now') WHERE id=? AND status='InProgress'`
+        ).bind(countId).run();
+        if (!gate.meta || gate.meta.changes === 0) return json({ ok: true, already_finished: true });
+
+        const locationId = cnt.location_id;
+        const loc = await env.DB.prepare(`SELECT id, type, name, assigned_tech_id FROM crm_inventory_locations WHERE id=?`).bind(locationId).first();
+        const isVan = loc && loc.type === "truck";
+        const { cmo, cd } = (() => { const [, mo, d] = pacificDayBoundsUTC().dayStr.split("-").map(Number); return { cmo: mo, cd: d }; })();
+        const nice = `${MON[cmo - 1]} ${cd}`;
+        // Name = who + mode + when. A VAN names the van's assigned tech; the COUNTER
+        // (actor) is stamped on the movements, and may differ (office counts a van).
+        const scope = cnt.scope || "full";
+        let cats = []; try { cats = cnt.scope_detail ? JSON.parse(cnt.scope_detail) : []; } catch {}
+        // Van name is "{Tech} — Truck"; strip the suffix so the label reads "(Pascal)".
+        let who = "shop";
+        if (isVan) who = (loc.name || "van").replace(/\s*—\s*Truck\s*$/i, "").trim() || "van";
+        const modeLabel = scope === "categories" ? `spot check – ${cats.join(", ")}` : (isVan ? "van count" : "re-count");
+        const name = isVan ? `(${who})/${modeLabel} (${nice})` : `shop ${modeLabel} (${nice})`;
+
+        // 1) Apply the counted quantities → on_hand + count_adjust movements tagged
+        //    to this session (reference_id) + the counter (actor_id). ENTERED items
+        //    only — uncounted items are left UNTOUCHED (no zero-assumption).
+        const counted = (await env.DB.prepare(
+          `SELECT material_id, actual_qty FROM crm_inventory_count_items WHERE count_id=? AND actual_qty IS NOT NULL`
+        ).bind(countId).all()).results || [];
+        if (counted.length) {
+          await saveLocationStock(env, locationId, counted.map((c) => ({ material_id: c.material_id, on_hand: c.actual_qty })), actorId, name, { referenceId: Number(countId), actorId });
+        }
+
+        // 2) COUNTED shortfall (this session's scope, ENTERED items only): below MIN,
+        //    fill to MAX. Uncounted / out-of-scope items are never force-ordered — a
+        //    genuine below-min there resurfaces in normal replenishment.
+        const short = (await env.DB.prepare(
+          `SELECT s.material_id, m.name, m.emco_sku, m.cost, (s.max_qty - s.on_hand) AS need
+             FROM crm_inventory_count_items ci
+             JOIN crm_inventory_stock s ON s.location_id=? AND s.material_id=ci.material_id
+             JOIN crm_materials m ON m.id=s.material_id
+            WHERE ci.count_id=? AND ci.actual_qty IS NOT NULL AND m.is_active=1
+              AND s.on_hand < s.min_qty AND (s.max_qty - s.on_hand) > 0
+            ORDER BY m.category, m.name`
+        ).bind(locationId, countId).all()).results || [];
+
+        const base = { ok: true, count_id: Number(countId), applied: counted.length, name, scope,
+          started_at: cnt.created_at, finished_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z") };
+
+        // 3) Nothing short → NO order ("✓ counted, no changes needed").
+        if (short.length === 0) return json({ ...base, order: null });
+
+        if (isVan) {
+          // Van: an EDITABLE/TRIMMABLE shop→van pull list — NOT committed here. The
+          // tech reviews, trims (partial funding), and commits (slice 3); trimmed-off
+          // lines stay below-min and resurface naturally.
+          return json({ ...base, order: { kind: "van_pull", location_id: Number(locationId), name,
+            lines: short.map((it) => ({ material_id: it.material_id, name: it.name, emco_sku: it.emco_sku, suggested_qty: it.need })) } });
+        }
+
+        // Shop: a SEPARATE, editable Draft PO named via notes (poName renders it).
+        // Commit (Send to EMCO) is a distinct later step.
+        const ins = await env.DB.prepare(`INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by, notes) VALUES ('EMCO','Draft',?,?)`).bind(actorId ?? null, name).run();
+        const poId = ins.meta?.last_row_id;
+        let total = 0;
+        const lineStmts = short.map((it) => {
+          const unit = Number(it.cost) || 0; const lt = unit * it.need; total += lt;
+          return env.DB.prepare(`INSERT INTO crm_inventory_po_items (po_id, material_id, qty_ordered, qty_received, vendor_part_number, unit_cost, line_total, source) VALUES (?,?,?,0,?,?,?,'manual')`).bind(poId, it.material_id, it.need, it.emco_sku ?? null, unit, lt);
+        });
+        for (let i = 0; i < lineStmts.length; i += 50) await env.DB.batch(lineStmts.slice(i, i + 50));
+        await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(Math.round(total * 100) / 100, poId).run();
+        return json({ ...base, order: { kind: "shop_po", po_id: poId, status: "Draft", total: Math.round(total * 100) / 100, lines: short.length } });
+      }
+
+      // 9e. POST /api/counts/:id/discard — abandon a session: writes NOTHING (no
+      //   count_adjust, no order), frees the location's one-open-session slot.
+      const countDiscardMatch = p.match(/^\/api\/counts\/(\d+)\/discard$/);
+      if (countDiscardMatch && request.method === "POST") {
+        const countId = countDiscardMatch[1];
+        const r = await env.DB.prepare(`UPDATE crm_inventory_counts SET status='Cancelled', completed_at=datetime('now') WHERE id=? AND status='InProgress'`).bind(countId).run();
+        return json({ ok: true, discarded: (r.meta && r.meta.changes) ? 1 : 0 });
+      }
+
+      // 9f. POST /api/counts/:id/commit-pull { actor_id, name?, lines:[{material_id, qty}] }
+      //   Commit a TRIMMED van-count pull (shop→van). ONLY the sent lines move; the
+      //   rest stay below-min and resurface in normal replenishment. One undo batch,
+      //   tagged with the count name.
+      const countCommitMatch = p.match(/^\/api\/counts\/(\d+)\/commit-pull$/);
+      if (countCommitMatch && request.method === "POST") {
+        const countId = countCommitMatch[1];
+        const b = await request.json().catch(() => ({}));
+        const actorId = b.actor_id ?? null;
+        const lines = Array.isArray(b.lines) ? b.lines : [];
+        const cnt = await env.DB.prepare(`SELECT location_id FROM crm_inventory_counts WHERE id=?`).bind(countId).first();
+        if (!cnt) return json({ error: "count not found" }, 404);
+        const note = b.name || `van count ${countId}`;
+        const batchId = `count:${countId}`;
+        const results = [];
+        for (const ln of lines) {
+          const qty = Number(ln.qty) || 0;
+          if (ln.material_id == null || qty <= 0) continue;
+          try { results.push(await pullShopToVan(env, cnt.location_id, ln.material_id, qty, actorId, Number(countId), { batchId, note, reportShortfall: true })); }
+          catch (e) { results.push({ material_id: ln.material_id, result: "failed", error: String(e.message || e) }); }
+        }
+        return json({ ok: true, batch_id: batchId, results });
+      }
+
       // 8a-2. POST /api/reorder/dismiss  body { material_id, undo? }
       //   Hide a material from the suggested reorder list (view flag only — sets
       //   reorder_dismissed_at on the SHOP row, loc 1). It re-surfaces on the next
@@ -2570,7 +2779,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const b = await request.json();
         const items = Array.isArray(b.items) ? b.items : [];
         let po = await env.DB.prepare(
-          `SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`
+          `SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' AND (notes IS NULL OR notes GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]') ORDER BY id DESC LIMIT 1`
         ).first();
         if (!po) {
           const coverStart = await reorderCoverStart(env);   // window start = last order's date
@@ -2634,7 +2843,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (mid == null || qty <= 0) return json({ error: "material_id and qty>0 required" }, 400);
         const mat = await env.DB.prepare(`SELECT id, cost, emco_sku FROM crm_materials WHERE id=?`).bind(mid).first();
         if (!mat) return json({ error: "material not found" }, 404);
-        let po = await env.DB.prepare(`SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`).first();
+        let po = await env.DB.prepare(`SELECT id FROM crm_inventory_purchase_orders WHERE status='Draft' AND (notes IS NULL OR notes GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]') ORDER BY id DESC LIMIT 1`).first();
         if (!po) {
           const coverStart = await reorderCoverStart(env);   // window start = last order's date
           const ins = await env.DB.prepare(`INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by, notes) VALUES ('EMCO','Draft',?,?)`).bind(b.created_by ?? 8, coverStart).run();
@@ -2780,7 +2989,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
       // 8f. GET /api/reorder/po/current — the open Draft PO with its lines (or null).
       if (p === "/api/reorder/po/current" && request.method === "GET") {
         const po = await env.DB.prepare(
-          `SELECT id, status, total, created_at, sent_at, received_at, notes FROM crm_inventory_purchase_orders WHERE status='Draft' ORDER BY id DESC LIMIT 1`
+          `SELECT id, status, total, created_at, sent_at, received_at, notes FROM crm_inventory_purchase_orders WHERE status='Draft' AND (notes IS NULL OR notes GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]') ORDER BY id DESC LIMIT 1`
         ).first();
         if (!po) return json({ po: null });
         const lines = (await env.DB.prepare(

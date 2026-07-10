@@ -212,6 +212,7 @@ async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {})
 // still a draft. Renders as "Jun 28 – Jul 3" (single day → "Jul 3"; cross-year
 // shows the year).
 const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHF = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 function poCoverageName(notesStart, endTs) {
   const s = String(notesStart || "").slice(0, 10);
   if (!/^\d{4}-\d\d-\d\d$/.test(s)) return null;                 // notes doesn't hold a date → no label
@@ -815,7 +816,7 @@ export default {
         // is_active filters out retired catalog items. unit/category help the capture UI.
         const r = await env.DB.prepare(
           `SELECT id, code, emco_sku, name, cost, price, unit, category, search_terms,
-                  conversion_factor, use_unit, purchase_unit, deduct_on_use,
+                  conversion_factor, use_unit, purchase_unit, deduct_on_use, prompt_restock,
                   ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials
             WHERE is_active = 1
@@ -831,7 +832,7 @@ export default {
       // browse below the search bar. Lean fields: just what add()/display need.
       if (p === "/api/materials/by-category" && request.method === "GET") {
         const rows = (await env.DB.prepare(
-          `SELECT id, name, cost, category, conversion_factor, use_unit, deduct_on_use,
+          `SELECT id, name, cost, category, conversion_factor, use_unit, deduct_on_use, prompt_restock,
                   ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials WHERE is_active = 1 ORDER BY category, name`
         ).all()).results || [];
@@ -839,7 +840,7 @@ export default {
         for (const r of rows) {
           const cat = r.category || "Uncategorized";
           if (!map.has(cat)) map.set(cat, []);
-          map.get(cat).push({ id: r.id, name: r.name, cost: r.cost, conversion_factor: r.conversion_factor, use_unit: r.use_unit, deduct_on_use: r.deduct_on_use, cost_per_use: r.cost_per_use });
+          map.get(cat).push({ id: r.id, name: r.name, cost: r.cost, conversion_factor: r.conversion_factor, use_unit: r.use_unit, deduct_on_use: r.deduct_on_use, prompt_restock: r.prompt_restock, cost_per_use: r.cost_per_use });
         }
         const categories = [...map.entries()].map(([name, items]) => ({ name, count: items.length, items }));
         return json({ categories });
@@ -2210,7 +2211,77 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
             results.push({ material_id: it.material_id, result: "failed", error: String(e.message || e) });
           }
         }
+        // Close any open restock-requests for the materials just pulled onto this
+        // van — a pull IS the fulfilment. (Non-fatal; the transfer is the truth.)
+        try {
+          const pulled = results.filter((r) => r.result === "pulled_shop").map((r) => r.material_id);
+          if (pulled.length) {
+            const ph = pulled.map(() => "?").join(",");
+            await env.DB.prepare(
+              `UPDATE crm_restock_requests SET fulfilled_at=datetime('now') WHERE location_id=? AND fulfilled_at IS NULL AND material_id IN (${ph})`
+            ).bind(van.id, ...pulled).run();
+          }
+        } catch (_) { /* request cleanup is best-effort */ }
         return json({ van_id: van.id, van_name: van.name, batch_id: batchId, results });
+      }
+
+      // ===== Restock requests (opt-in restock; TODO 4 prompt + TODO 1 office add) =====
+      // A persisted, per-van "please restock this" line — created by a tech tapping
+      // Yes on the "Restock this on your van?" prompt for a prompt_restock item, or
+      // by the office adding to a tech's pull list. Surfaced in the FromShop restock;
+      // cleared when the material is pulled (above) or dismissed. DEDUP: at most ONE
+      // open request per (van, material) — enforced by a partial-unique index AND a
+      // pre-check, so repeat logs of the same pipe never stack rows.
+      if (p === "/api/restock-requests" && request.method === "POST") {
+        const b = await request.json().catch(() => ({}));
+        let locationId = b.location_id;
+        const techId = b.tech_id ?? (techTok ? techTok.payload.tech_id : null);
+        if (locationId == null && techId != null) {
+          const van = await env.DB.prepare(`SELECT id FROM crm_inventory_locations WHERE type='truck' AND active=1 AND assigned_tech_id = ?`).bind(techId).first();
+          if (van) locationId = van.id;
+        }
+        if (locationId == null || b.material_id == null) return json({ error: "location_id (or tech_id) and material_id required" }, 400);
+        const qty = Number(b.qty) > 0 ? Number(b.qty) : 1;
+        const createdBy = b.actor_id ?? b.created_by ?? techId ?? null;
+        // Dedup: an OPEN request for this van+material already covers it → no-op.
+        const open = await env.DB.prepare(`SELECT id, qty FROM crm_restock_requests WHERE location_id=? AND material_id=? AND fulfilled_at IS NULL`).bind(locationId, b.material_id).first();
+        if (open) return json({ ok: true, id: open.id, deduped: true, qty: open.qty });
+        try {
+          const ins = await env.DB.prepare(`INSERT INTO crm_restock_requests (location_id, material_id, qty, created_by) VALUES (?,?,?,?)`).bind(locationId, b.material_id, qty, createdBy).run();
+          return json({ ok: true, id: ins.meta?.last_row_id ?? null, deduped: false, qty });
+        } catch (e) {
+          // Race backstop: the partial-unique index rejected a concurrent insert.
+          const ex = await env.DB.prepare(`SELECT id, qty FROM crm_restock_requests WHERE location_id=? AND material_id=? AND fulfilled_at IS NULL`).bind(locationId, b.material_id).first();
+          if (ex) return json({ ok: true, id: ex.id, deduped: true, qty: ex.qty });
+          return json({ error: String(e.message || e) }, 500);
+        }
+      }
+
+      // GET /api/restock-requests?location_id= | ?tech_id=  — OPEN requests for a van.
+      if (p === "/api/restock-requests" && request.method === "GET") {
+        let locationId = url.searchParams.get("location_id");
+        const techId = url.searchParams.get("tech_id");
+        if (!locationId && techId) {
+          const van = await env.DB.prepare(`SELECT id FROM crm_inventory_locations WHERE type='truck' AND active=1 AND assigned_tech_id = ?`).bind(techId).first();
+          if (van) locationId = van.id;
+        }
+        if (!locationId) return json({ error: "location_id or tech_id required" }, 400);
+        const rows = (await env.DB.prepare(
+          `SELECT rr.id, rr.material_id, rr.qty, rr.created_by, rr.created_at,
+                  m.name, m.emco_sku, m.cost, m.purchase_unit, m.use_unit
+             FROM crm_restock_requests rr JOIN crm_materials m ON m.id = rr.material_id
+            WHERE rr.location_id = ? AND rr.fulfilled_at IS NULL
+            ORDER BY rr.created_at DESC`
+        ).bind(locationId).all()).results || [];
+        return json({ location_id: Number(locationId) || locationId, requests: rows });
+      }
+
+      // DELETE /api/restock-requests/:id — dismiss (mark fulfilled; frees the dedup slot).
+      const rrDelMatch = p.match(/^\/api\/restock-requests\/(\d+)$/);
+      if (rrDelMatch && request.method === "DELETE") {
+        const id = Number(rrDelMatch[1]);
+        await env.DB.prepare(`UPDATE crm_restock_requests SET fulfilled_at=datetime('now') WHERE id=? AND fulfilled_at IS NULL`).bind(id).run();
+        return json({ ok: true, id });
       }
 
       // --- 6a. Shop (warehouse) stock — full dump for count/levels views --
@@ -2285,7 +2356,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (q) where.push("(name LIKE ? OR emco_sku LIKE ? OR code LIKE ?)");
         const stmt = env.DB.prepare(
           `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max,
-                  purchase_unit, use_unit, conversion_factor, cost_per_use_override, deduct_on_use,
+                  purchase_unit, use_unit, conversion_factor, cost_per_use_override, deduct_on_use, prompt_restock,
                   ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials
             ${where.length ? "WHERE " + where.join(" AND ") : ""}
@@ -2367,8 +2438,8 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const id = catMatch[1];
         const b = await request.json();
         const fields = ["name","category","cost","price","emco_sku","code","bin_location","unit","subcategory","search_terms","is_active","default_min","default_max",
-                        "purchase_unit","use_unit","conversion_factor","cost_per_use_override","deduct_on_use"];
-        const numeric = ["cost","price","is_active","default_min","default_max","conversion_factor","deduct_on_use"];
+                        "purchase_unit","use_unit","conversion_factor","cost_per_use_override","deduct_on_use","prompt_restock"];
+        const numeric = ["cost","price","is_active","default_min","default_max","conversion_factor","deduct_on_use","prompt_restock"];
         const sets = []; const binds = [];
         for (const f of fields) {
           if (b[f] === undefined) continue;
@@ -2409,7 +2480,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         }
         const row = await env.DB.prepare(
           `SELECT id, name, emco_sku, code, category, bin_location, cost, price, unit, is_active, search_terms, default_min, default_max,
-                  purchase_unit, use_unit, conversion_factor, cost_per_use_override, deduct_on_use,
+                  purchase_unit, use_unit, conversion_factor, cost_per_use_override, deduct_on_use, prompt_restock,
                   ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials WHERE id=?`
         ).bind(id).first();
@@ -2686,17 +2757,19 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const locationId = cnt.location_id;
         const loc = await env.DB.prepare(`SELECT id, type, name, assigned_tech_id FROM crm_inventory_locations WHERE id=?`).bind(locationId).first();
         const isVan = loc && loc.type === "truck";
-        const { cmo, cd } = (() => { const [, mo, d] = pacificDayBoundsUTC().dayStr.split("-").map(Number); return { cmo: mo, cd: d }; })();
-        const nice = `${MON[cmo - 1]} ${cd}`;
-        // Name = who + mode + when. A VAN names the van's assigned tech; the COUNTER
-        // (actor) is stamped on the movements, and may differ (office counts a van).
+        const [yr, mo, dd] = pacificDayBoundsUTC().dayStr.split("-").map(Number);
+        const niceDate = `${MONTHF[mo - 1]} ${dd}/${String(yr).slice(-2)}`;   // "July 10/26"
+        // Label = "{who} — {Month D/YY} · {type}". The trailing " · {type}" segment
+        // is split off into a small TYPE tag by the Count Orders UI; other surfaces
+        // (poName, PO lists, tech summary) show the whole self-contained string.
+        // A VAN names the van's assigned tech; the COUNTER (actor) is on the movements.
         const scope = cnt.scope || "full";
         let cats = []; try { cats = cnt.scope_detail ? JSON.parse(cnt.scope_detail) : []; } catch {}
-        // Van name is "{Tech} — Truck"; strip the suffix so the label reads "(Pascal)".
-        let who = "shop";
-        if (isVan) who = (loc.name || "van").replace(/\s*—\s*Truck\s*$/i, "").trim() || "van";
-        const modeLabel = scope === "categories" ? `spot check – ${cats.join(", ")}` : (isVan ? "van count" : "re-count");
-        const name = isVan ? `(${who})/${modeLabel} (${nice})` : `shop ${modeLabel} (${nice})`;
+        // Van name is "{Tech} — Truck"; strip the suffix so the label reads "Brook".
+        let who = "Shop";
+        if (isVan) who = (loc.name || "van").replace(/\s*—\s*Truck\s*$/i, "").trim() || "Van";
+        const typeLabel = scope === "categories" ? `spot check – ${cats.join(", ")}` : (isVan ? "van count" : "re-count");
+        const name = `${who} — ${niceDate} · ${typeLabel}`;
 
         // 1) Apply the counted quantities → on_hand + count_adjust movements tagged
         //    to this session (reference_id) + the counter (actor_id). ENTERED items

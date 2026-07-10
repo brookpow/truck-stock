@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
   scanReceipt, savePurchase, saveOverheadPurchase, restockFromShop, getJobPurchases, deletePurchase, patchPurchase,
   getByCategory, createRequest, receiptPhotoUrl,
+  startCount, getCurrentCount, saveCountItems, finishCount, discardCount,
   techList, techLogin, getTechToken, setTechToken, setOnAuthLost } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
 import { C, FONT, DISP, SHADOW, BADGE } from "./theme.js";
@@ -179,6 +180,11 @@ function Jobs({ tech, onSignOut }) {
   const [fromShop, setFromShop] = useState(false); // restock from shop (shop→van transfer)
   const [err, setErr] = useState(false);
   const [refreshing, setRefreshing] = useState(false); // manual ↻ in-flight
+  const [countView, setCountView] = useState(null);  // { start:{scope,categories} } | { resume: countObj }
+  const [spotPicker, setSpotPicker] = useState(false);
+  const [openCount, setOpenCount] = useState(null);  // an in_progress count on this van (resume banner)
+  function refreshOpenCount() { getCurrentCount({ techId: tech.st_tech_id }).then(setOpenCount).catch(() => {}); }
+  useEffect(() => { refreshOpenCount(); }, [tech]);
 
   // Load today's jobs. `silent` = a background refresh (poll / regained focus):
   // keep the current list on screen instead of blanking to the spinner, so a tech
@@ -231,6 +237,14 @@ function Jobs({ tech, onSignOut }) {
   if (fromShop) {
     return <FromShopRestock tech={tech} onBack={() => setFromShop(false)} />;
   }
+  if (spotPicker) {
+    return <SpotCheckPicker onCancel={() => setSpotPicker(false)}
+      onStart={(categories) => { setSpotPicker(false); setCountView({ start: { scope: "categories", categories } }); }} />;
+  }
+  if (countView) {
+    return <CountScreen tech={tech} start={countView.start} resume={countView.resume}
+      onExit={() => { setCountView(null); refreshOpenCount(); loadJobs({ silent: true }); }} />;
+  }
 
   const jobs = data ? data.jobs : null;
   const recent = (data && data.recent) || [];
@@ -250,6 +264,13 @@ function Jobs({ tech, onSignOut }) {
           {refreshing ? "…" : "↻ refresh"}
         </button>
       </div>
+
+      {openCount && (
+        <button style={styles.resumeBanner} className="fm-press" onClick={() => setCountView({ resume: openCount })}>
+          <span>▶ Resume {openCount.scope === "categories" ? "spot check" : "van count"} — {(openCount.items || []).filter((i) => i.actual_qty != null).length}/{(openCount.items || []).length} counted</span>
+          <span style={styles.resumeSub}>started {String(openCount.created_at || "").slice(0, 10)}</span>
+        </button>
+      )}
 
       {!jobs && !err && <div style={styles.muted}>Loading jobs…</div>}
 
@@ -281,6 +302,28 @@ function Jobs({ tech, onSignOut }) {
           <span style={styles.actDesc}>supplier purchase — packing slip or delivery note</span>
         </span>
       </button>
+      {!openCount && (
+        <button style={styles.actRow} className="fm-press" onClick={() => setCountView({ start: { scope: "full" } })}>
+          <span style={{ ...styles.actIco, color: C.purpleInk, background: C.purpleWash }}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 11l3 3L22 4" /><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" /></svg>
+          </span>
+          <span style={styles.actText}>
+            <span style={styles.actTitle}>Count my van</span>
+            <span style={styles.actDesc}>full count — verify every stocked item</span>
+          </span>
+        </button>
+      )}
+      {!openCount && (
+        <button style={styles.actRow} className="fm-press" onClick={() => setSpotPicker(true)}>
+          <span style={{ ...styles.actIco, color: C.amberInk, background: C.amberWash }}>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="7" /><path d="M21 21l-4-4" /></svg>
+          </span>
+          <span style={styles.actText}>
+            <span style={styles.actTitle}>Spot check</span>
+            <span style={styles.actDesc}>count just a category or two</span>
+          </span>
+        </button>
+      )}
       <button style={styles.actRow} className="fm-press" onClick={() => setFromShop(true)}>
         <span style={{ ...styles.actIco, color: C.greenInk, background: C.greenWash }}>
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 8l9-5 9 5-9 5z" /><path d="M3 8v8l9 5 9-5V8" /></svg>
@@ -330,20 +373,32 @@ function Jobs({ tech, onSignOut }) {
 // by-the-foot pipe gets a FEET entry (enter length used, not a count) + "add ft".
 function AddMaterialBtn({ m, saving, add }) {
   const [qty, setQty] = useState("");
-  // Normal each-item (conversion ×1): the quick +1 stepper.
-  if (!(m.conversion_factor && m.conversion_factor !== 1)) {
-    return <button style={styles.addBtn} disabled={saving} onClick={() => add(m, 1)} aria-label={"add " + m.name}>+</button>;
-  }
-  // Converted item (pipe → ft, bag → each): type the use-units, labeled by use_unit.
-  const u = m.use_unit || "use";
   const n = Number(qty);
+  // Converted item (pipe → ft, bag → each): type the use-units, labeled by use_unit.
+  if (m.conversion_factor && m.conversion_factor !== 1) {
+    const u = m.use_unit || "use";
+    return (
+      <div style={styles.feetAdd}>
+        <input type="number" inputMode="decimal" min="0" step="0.5" placeholder={u}
+          value={qty} onChange={(e) => setQty(e.target.value)}
+          style={styles.feetInput} aria-label={u + " of " + m.name} />
+        <button style={styles.feetAddBtn} disabled={saving || !(n > 0)}
+          onClick={() => { add(m, n); setQty(""); }} aria-label={"add " + u + " of " + m.name}>add {u}</button>
+      </div>
+    );
+  }
+  // Normal each-item: type a COUNT + add (logs one line at that qty), PLUS the quick
+  // +1 for one-offs. Enter in the box also submits. This is why GP now reflects "4
+  // copper 90s" instead of a lone qty-1 line the tech had to remember to edit.
   return (
     <div style={styles.feetAdd}>
-      <input type="number" inputMode="decimal" min="0" step="0.5" placeholder={u}
-        value={qty} onChange={(e) => setQty(e.target.value)}
-        style={styles.feetInput} aria-label={u + " of " + m.name} />
+      <input type="number" inputMode="numeric" min="1" step="1" placeholder="qty"
+        value={qty} onChange={(e) => setQty(e.target.value.replace(/[^0-9]/g, ""))}
+        onKeyDown={(e) => { if (e.key === "Enter" && n > 0) { add(m, n); setQty(""); } }}
+        style={styles.feetInput} aria-label={"quantity of " + m.name} />
       <button style={styles.feetAddBtn} disabled={saving || !(n > 0)}
-        onClick={() => { add(m, n); setQty(""); }} aria-label={"add " + u + " of " + m.name}>add {u}</button>
+        onClick={() => { add(m, n); setQty(""); }} aria-label={"add " + (n || "") + " " + m.name}>add</button>
+      <button style={styles.addBtn} disabled={saving} onClick={() => add(m, 1)} aria-label={"add one " + m.name}>+</button>
     </div>
   );
 }
@@ -1087,6 +1142,145 @@ function ReceiptScan({ tech, job = null, jobsData = null, onDone, onCancel }) {
   );
 }
 
+// ---- Cycle count: the mobile-first count screen (Count my van / Spot check) --
+function CountScreen({ tech, start, resume, onExit }) {
+  const [phase, setPhase] = useState(resume ? "counting" : "starting"); // starting|counting|saving|complete|error
+  const [count, setCount] = useState(resume || null);
+  const [actuals, setActuals] = useState(() => {
+    const m = {}; (resume?.items || []).forEach((it) => { if (it.actual_qty != null) m[it.material_id] = String(it.actual_qty); }); return m;
+  });
+  const [result, setResult] = useState(null);
+  const [err, setErr] = useState(null);
+  const [confirmAction, setConfirmAction] = useState(null); // 'complete' | 'discard'
+
+  const countId = count && (count.count_id || count.id);
+  const items = (count && count.items) || [];
+  const countedN = items.reduce((n, it) => n + ((actuals[it.material_id] != null && actuals[it.material_id] !== "") ? 1 : 0), 0);
+  const startedRef = useRef(false);
+
+  useEffect(() => {
+    if (resume) return;
+    if (startedRef.current) return;   // StrictMode double-invokes effects — start ONCE (twin-session guard, server-side too)
+    startedRef.current = true;
+    startCount({ techId: tech.st_tech_id, actorId: tech.st_tech_id, scope: start.scope, categories: start.categories })
+      .then((d) => { setCount(d); setPhase("counting"); })
+      .catch((e) => { setErr(String(e.message || e)); setPhase("error"); });
+  }, []);
+
+  const entered = () => items
+    .filter((it) => actuals[it.material_id] != null && actuals[it.material_id] !== "")
+    .map((it) => ({ material_id: it.material_id, actual_qty: Number(actuals[it.material_id]) }));
+
+  async function pause() { try { await saveCountItems(countId, entered()); } catch {} onExit(); }
+  async function doComplete() {
+    setConfirmAction(null); setPhase("saving");
+    try {
+      await saveCountItems(countId, entered());
+      const res = await finishCount(countId, tech.st_tech_id);
+      setResult(res);
+      setPhase("complete");
+    } catch (e) { setErr(String(e.message || e)); setPhase("counting"); }
+  }
+  async function doDiscard() { setConfirmAction(null); try { await discardCount(countId); } catch {} onExit(); }
+
+  if (phase === "starting") return <div style={styles.screen}><div style={styles.muted}>Starting count…</div></div>;
+  if (phase === "error") return (
+    <div style={styles.screen}><div style={styles.error}>{err || "Couldn't start the count."}</div>
+      <button style={styles.scanBtn} onClick={onExit}>← back</button></div>
+  );
+
+  if (phase === "complete") {
+    const o = result && result.order;
+    return (
+      <div style={styles.screen}>
+        <h1 style={styles.h1}>{result.name}</h1>
+        <div style={styles.muted}>{result.applied} item{result.applied === 1 ? "" : "s"} counted · started {String(result.started_at || "").slice(0, 10)} · finished {String(result.finished_at || "").slice(0, 10)}</div>
+        {!o && <div style={styles.countDone}>✓ Counted — no changes needed. Nothing below par.</div>}
+        {o && o.kind === "van_count_order" && (
+          <div style={styles.countDone}>✓ {o.lines} item{o.lines === 1 ? "" : "s"} below par — sent to the office as a van-count order. They'll fill it from the shop or order from EMCO; your van refills when it's received.</div>
+        )}
+        {o && o.kind === "shop_po" && (
+          <div style={styles.countDone}>✓ Draft order created ({o.lines} line{o.lines === 1 ? "" : "s"}, {fmt(o.total)}) — review &amp; send it from the office.</div>
+        )}
+        <button style={styles.primary} onClick={onExit}>Done</button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.screen}>
+      <div style={styles.topbar}><span style={styles.who}>{(count && count.location_name) || "Count"}{count && count.scope === "categories" ? " · spot check" : ""}</span></div>
+      <div style={styles.countProgress}>
+        <div style={styles.countProgressBar}><div style={{ ...styles.countProgressFill, width: `${items.length ? Math.round(countedN / items.length * 100) : 0}%` }} /></div>
+        <span style={styles.muted}>{countedN}/{items.length} counted</span>
+      </div>
+      {err && <div style={styles.error}>{err}</div>}
+      <div style={{ paddingBottom: 92 }}>
+        {items.map((it) => {
+          const v = actuals[it.material_id] ?? "";
+          return (
+            <div key={it.material_id} style={v !== "" ? { ...styles.countCard, borderColor: C.green } : styles.countCard}>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={styles.countName}>{it.name}</div>
+                <div style={styles.muted}>have {it.expected_qty}{it.emco_sku ? ` · ${it.emco_sku}` : ""}</div>
+              </div>
+              <input style={styles.countInput} inputMode="numeric" placeholder="—" value={v}
+                onChange={(e) => setActuals((a) => ({ ...a, [it.material_id]: e.target.value.replace(/[^0-9]/g, "") }))} />
+            </div>
+          );
+        })}
+      </div>
+      <div style={styles.countBar}>
+        <button style={styles.countBtnPause} disabled={phase === "saving"} onClick={pause}>⏸ Pause</button>
+        <button style={styles.countBtnComplete} disabled={phase === "saving"} onClick={() => setConfirmAction("complete")}>{phase === "saving" ? "…" : "✓ Complete"}</button>
+        <button style={styles.countBtnDiscard} disabled={phase === "saving"} onClick={() => setConfirmAction("discard")}>✕</button>
+      </div>
+      {confirmAction === "complete" && (
+        <div style={styles.countOverlay} onClick={() => setConfirmAction(null)}>
+          <div style={styles.countModal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.countModalTitle}>Complete this count?</div>
+            <div style={styles.sub}>Applies your {countedN} counted item{countedN === 1 ? "" : "s"} and builds the restock list. Uncounted items are left untouched.</div>
+            <button style={styles.primary} onClick={doComplete}>✓ Complete count</button>
+            <button style={styles.scanBtn} onClick={() => setConfirmAction(null)}>keep counting</button>
+          </div>
+        </div>
+      )}
+      {confirmAction === "discard" && (
+        <div style={styles.countOverlay} onClick={() => setConfirmAction(null)}>
+          <div style={styles.countModal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.countModalTitle}>Discard this count?</div>
+            <div style={styles.sub}>Throws away everything you entered — nothing saved, no stock changes.</div>
+            <button style={{ ...styles.primary, background: C.red }} onClick={doDiscard}>✕ Discard</button>
+            <button style={styles.scanBtn} onClick={() => setConfirmAction(null)}>keep counting</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Spot check: pick categories, then count just those ----------------------
+function SpotCheckPicker({ onStart, onCancel }) {
+  const [cats, setCats] = useState(null);
+  const [picked, setPicked] = useState({});
+  useEffect(() => { getByCategory().then((d) => setCats((d.categories || []).map((c) => c.name))).catch(() => setCats([])); }, []);
+  const chosen = Object.keys(picked).filter((k) => picked[k]);
+  return (
+    <div style={styles.screen}>
+      <div style={styles.topbar}><button style={styles.linkBtn} onClick={onCancel}>← back</button><span style={styles.who}>Spot check</span></div>
+      <h1 style={styles.h1}>Which categories?</h1>
+      <p style={styles.sub}>Count just the categories you're checking — completing verifies only what you pick.</p>
+      {!cats && <div style={styles.muted}>Loading…</div>}
+      {(cats || []).map((c) => (
+        <button key={c} style={picked[c] ? { ...styles.spotCat, borderColor: C.blue, background: C.blueWash } : styles.spotCat} className="fm-press" onClick={() => setPicked((p) => ({ ...p, [c]: !p[c] }))}>
+          <span>{c}</span><span>{picked[c] ? "✓" : ""}</span>
+        </button>
+      ))}
+      {chosen.length > 0 && <button style={styles.spotStart} onClick={() => onStart(chosen)}>Start spot check ({chosen.length})</button>}
+    </div>
+  );
+}
+
 // ---- From-shop restock: pull stock from the shop to the tech's van -------
 function FromShopRestock({ tech, onBack }) {
   const [q, setQ] = useState("");
@@ -1262,6 +1456,27 @@ const styles = {
   jobPickRow: { ...card, display: "flex", flexDirection: "column", gap: 2, width: "100%", textAlign: "left", cursor: "pointer", padding: "13px 15px", borderRadius: 14, marginBottom: 8 },
   jobPickCust: { fontFamily: DISP, fontWeight: 700, fontSize: 15.5, letterSpacing: "-.01em", color: C.ink },
   manualPickRow: { display: "flex", gap: 8, alignItems: "center", marginTop: 14 },
+  // ── Cycle count (Start Count) — mobile-first ──
+  resumeBanner: { ...card, display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", textAlign: "left", cursor: "pointer", padding: "14px 16px", marginBottom: 12, borderRadius: 14, background: C.purpleWash, border: `1px solid ${C.purple}`, color: C.purpleInk, fontWeight: 700, fontSize: 15 },
+  resumeSub: { fontSize: 12.5, fontWeight: 600, color: C.purpleInk, opacity: 0.8 },
+  countProgress: { display: "flex", alignItems: "center", gap: 10, margin: "4px 0 12px" },
+  countProgressBar: { flex: 1, height: 8, background: C.sunk, borderRadius: 999, overflow: "hidden" },
+  countProgressFill: { height: "100%", background: C.green, borderRadius: 999, transition: "width .2s ease" },
+  countCard: { ...card, display: "flex", alignItems: "center", gap: 12, padding: "12px 14px", marginBottom: 8, borderRadius: 14, border: `1px solid ${C.hair}` },
+  countName: { fontWeight: 600, fontSize: 15, color: C.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+  countInput: { ...ctl, width: 84, height: 56, fontSize: 24, fontWeight: 700, textAlign: "center", padding: 0, flex: "none" },
+  countBar: { position: "fixed", left: 0, right: 0, bottom: 0, zIndex: 20, display: "flex", gap: 8, padding: "10px 14px calc(10px + env(safe-area-inset-bottom))", background: C.surface, borderTop: `1px solid ${C.hair}`, boxShadow: "0 -4px 16px -8px rgba(20,21,26,.2)" },
+  countBtnPause: { flex: "none", height: 52, padding: "0 16px", fontSize: 15, fontWeight: 700, background: C.sunk, color: C.ink2, border: "none", borderRadius: 12, cursor: "pointer" },
+  countBtnComplete: { flex: 1, height: 52, fontSize: 16, fontWeight: 700, background: C.green, color: "#fff", border: "none", borderRadius: 12, cursor: "pointer" },
+  countBtnDiscard: { flex: "none", width: 52, height: 52, fontSize: 18, fontWeight: 700, background: C.redWash, color: C.redInk, border: "none", borderRadius: 12, cursor: "pointer" },
+  countOverlay: { position: "fixed", inset: 0, background: "rgba(20,21,26,.4)", zIndex: 50, display: "flex", alignItems: "flex-end", justifyContent: "center", padding: 0 },
+  countModal: { ...card, width: "100%", maxWidth: 520, padding: "20px 18px calc(18px + env(safe-area-inset-bottom))", borderRadius: "18px 18px 0 0" },
+  countModalTitle: { fontFamily: DISP, fontSize: 20, fontWeight: 800, letterSpacing: "-.02em", color: C.ink, marginBottom: 6 },
+  countDone: { fontSize: 15, fontWeight: 600, color: C.greenInk, background: C.greenWash, borderRadius: 12, padding: "14px 16px", margin: "14px 0" },
+  countPullRow: { display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.hair}`, fontSize: 15, color: C.ink },
+  countPullQty: { ...ctl, width: 64, height: 44, fontSize: 16, fontWeight: 700, textAlign: "center", padding: 0, flex: "none" },
+  spotCat: { ...card, display: "flex", justifyContent: "space-between", alignItems: "center", width: "100%", textAlign: "left", cursor: "pointer", padding: "14px 16px", marginBottom: 8, borderRadius: 12, border: `1px solid ${C.hair}`, fontSize: 15.5, fontWeight: 600, color: C.ink },
+  spotStart: { position: "sticky", bottom: 12, width: "100%", height: 52, fontSize: 16, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer", marginTop: 12 },
   rcptLine: { ...card, borderRadius: 14, padding: "10px 12px", marginBottom: 8 },
   rcptDesc: { ...ctl, width: "100%", height: 40, fontSize: 15, padding: "0 10px", marginBottom: 6 },
   rcptRow2: { display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" },

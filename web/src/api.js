@@ -219,3 +219,53 @@ export async function createRequest(body) {
 export function receiptPhotoUrl(id) {
   return `${API}/api/purchases/${encodeURIComponent(id)}/photo`;
 }
+
+// ── Cycle counts (Start Count) ──────────────────────────────────────────────
+// Start a count session + snapshot. Tech counts its own van → pass techId (the
+// worker resolves the van). scope: 'full' | 'categories' (+ categories[]).
+export async function startCount({ locationId, techId, actorId, scope, categories }) {
+  const r = await fetch(`${API}/api/counts`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ location_id: locationId ?? null, tech_id: techId ?? null, actor_id: actorId ?? null, scope, categories }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("count " + r.status));
+  return d; // { count_id, location_name, scope, items:[...] }
+}
+export async function getCurrentCount({ locationId, techId }) {
+  const qs = locationId != null ? `location_id=${encodeURIComponent(locationId)}` : `tech_id=${encodeURIComponent(techId)}`;
+  const r = await fetch(`${API}/api/counts/current?${qs}`);
+  if (!r.ok) throw new Error("count " + r.status);
+  return (await r.json()).count; // { id, items, scope, scope_detail, created_at } | null
+}
+export async function saveCountItems(countId, items) {
+  const r = await fetch(`${API}/api/counts/${encodeURIComponent(countId)}/items`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("count-save " + r.status));
+  return d;
+}
+export async function finishCount(countId, actorId) {
+  const r = await fetch(`${API}/api/counts/${encodeURIComponent(countId)}/finish`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ actor_id: actorId }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("count-finish " + r.status));
+  return d; // { applied, order, name, started_at, finished_at }
+}
+export async function discardCount(countId) {
+  const r = await fetch(`${API}/api/counts/${encodeURIComponent(countId)}/discard`, { method: "POST" });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("count-discard " + r.status));
+  return d;
+}
+export async function commitCountPull(countId, actorId, name, lines) {
+  const r = await fetch(`${API}/api/counts/${encodeURIComponent(countId)}/commit-pull`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ actor_id: actorId, name, lines }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("commit-pull " + r.status));
+  return d;
+}

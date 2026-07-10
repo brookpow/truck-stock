@@ -234,7 +234,7 @@ async function poNameFor(env, poId) {
 // The coverage START for a NEW draft = the most recent prior order's date.
 async function reorderCoverStart(env) {
   const prev = await env.DB.prepare(
-    `SELECT MAX(COALESCE(sent_at, created_at)) AS ts FROM crm_inventory_purchase_orders WHERE status IN ('Sent','Partial','Received')`
+    `SELECT MAX(COALESCE(sent_at, created_at)) AS ts FROM crm_inventory_purchase_orders WHERE status IN ('Sent','Partial','Received') AND (location_id IS NULL OR location_id = 1)`
   ).first();
   return (prev && prev.ts) ? String(prev.ts).slice(0, 10) : new Date().toISOString().slice(0, 10);
 }
@@ -2525,6 +2525,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
                       JOIN crm_inventory_purchase_orders po ON po.id = pi.po_id
                      WHERE pi.material_id = s.material_id
                        AND po.status IN ('Sent','Partial')
+                       AND (po.location_id IS NULL OR po.location_id = 1)  -- shop POs only; a van-count EMCO order must NOT suppress the shop's own reorder
                   ), 0) AS already_on_order
              FROM crm_inventory_stock s
              JOIN crm_materials m ON m.id = s.material_id
@@ -2567,16 +2568,47 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (scope === "categories" && categories.length === 0) return json({ error: "categories required for a spot check" }, 400);
         const loc = await env.DB.prepare(`SELECT id, type, name, assigned_tech_id FROM crm_inventory_locations WHERE id=?`).bind(locationId).first();
         if (!loc) return json({ error: "location not found" }, 404);
-        const open = await env.DB.prepare(`SELECT id FROM crm_inventory_counts WHERE location_id=? AND status='InProgress' ORDER BY id DESC LIMIT 1`).bind(locationId).first();
-        if (open) return json({ error: "count_in_progress", count_id: open.id }, 409);
+        // ATOMIC one-open-session guard. A plain SELECT-then-INSERT races: a
+        // double-fired start (React StrictMode double-effect, a retry, or two
+        // devices) can pass the SELECT twice before either INSERT commits and
+        // create TWIN sessions (one gets counted, the orphan haunts the resume
+        // banner). The conditional INSERT is a single serialized statement — the
+        // 2nd caller's NOT EXISTS sees the 1st row and writes 0 changes. The
+        // loser then RESUMES the existing session (idempotent), never a twin.
+        const scopeDetail = scope === "categories" ? JSON.stringify(categories) : null;
+        const ins = await env.DB.prepare(
+          `INSERT INTO crm_inventory_counts (location_id, status, created_by, scope, scope_detail)
+           SELECT ?1, 'InProgress', ?2, ?3, ?4
+            WHERE NOT EXISTS (SELECT 1 FROM crm_inventory_counts WHERE location_id=?1 AND status='InProgress')`
+        ).bind(locationId, actorId, scope, scopeDetail).run();
+        if (!ins.meta || ins.meta.changes === 0) {
+          // Lost the race / double-fire → return the existing open session's items
+          // (same shape as a fresh start) so BOTH calls land on one count_id.
+          const ex = await env.DB.prepare(`SELECT id, scope, scope_detail FROM crm_inventory_counts WHERE location_id=? AND status='InProgress' ORDER BY id DESC LIMIT 1`).bind(locationId).first();
+          if (!ex) return json({ error: "count_in_progress" }, 409);
+          let exCats = []; try { exCats = ex.scope_detail ? JSON.parse(ex.scope_detail) : []; } catch {}
+          const exItems = (await env.DB.prepare(
+            `SELECT ci.material_id, m.name, m.emco_sku, m.category, ci.expected_qty, ci.actual_qty, s.min_qty, s.max_qty
+               FROM crm_inventory_count_items ci
+               JOIN crm_materials m ON m.id = ci.material_id
+               LEFT JOIN crm_inventory_stock s ON s.location_id = ? AND s.material_id = ci.material_id
+              WHERE ci.count_id = ? ORDER BY m.category, m.name`
+          ).bind(locationId, ex.id).all()).results || [];
+          return json({ count_id: ex.id, location_id: Number(locationId), location_name: loc.name, type: loc.type,
+            scope: ex.scope, categories: exCats, resumed: true,
+            items: exItems.map((s) => ({ material_id: s.material_id, name: s.name, emco_sku: s.emco_sku, category: s.category, expected_qty: s.expected_qty ?? 0, min_qty: s.min_qty, max_qty: s.max_qty, actual_qty: s.actual_qty })) });
+        }
+        const countId = ins.meta?.last_row_id;
         // Snapshot the location's stock list (min/max items only). A SPOT CHECK
         // narrows to the chosen categories — same machinery, smaller scope.
         let stock = (await getLocationStock(env, locationId)).filter((s) => (s.max_qty || 0) > 0 || (s.min_qty || 0) > 0);   // min/max items only (skip 0/0/0 non-stocked rows)
         if (scope === "categories") stock = stock.filter((s) => categories.includes(s.category));
-        if (stock.length === 0) return json({ error: "nothing_to_count", detail: scope === "categories" ? "no stocked items in those categories" : "location has no stock list" }, 400);
-        const scopeDetail = scope === "categories" ? JSON.stringify(categories) : null;
-        const ins = await env.DB.prepare(`INSERT INTO crm_inventory_counts (location_id, status, created_by, scope, scope_detail) VALUES (?, 'InProgress', ?, ?, ?)`).bind(locationId, actorId, scope, scopeDetail).run();
-        const countId = ins.meta?.last_row_id;
+        if (stock.length === 0) {
+          // Nothing to count under this scope → roll back the just-created shell so
+          // it doesn't linger as an empty InProgress session blocking the next start.
+          await env.DB.prepare(`UPDATE crm_inventory_counts SET status='Cancelled', completed_at=datetime('now') WHERE id=?`).bind(countId).run();
+          return json({ error: "nothing_to_count", detail: scope === "categories" ? "no stocked items in those categories" : "location has no stock list" }, 400);
+        }
         const stmts = stock.map((s) => env.DB.prepare(
           `INSERT INTO crm_inventory_count_items (count_id, material_id, expected_qty, actual_qty, variance) VALUES (?,?,?,NULL,NULL)`
         ).bind(countId, s.material_id, s.on_hand ?? 0));
@@ -2696,11 +2728,22 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (short.length === 0) return json({ ...base, order: null });
 
         if (isVan) {
-          // Van: an EDITABLE/TRIMMABLE shop→van pull list — NOT committed here. The
-          // tech reviews, trims (partial funding), and commits (slice 3); trimmed-off
-          // lines stay below-min and resurface naturally.
-          return json({ ...base, order: { kind: "van_pull", location_id: Number(locationId), name,
-            lines: short.map((it) => ({ material_id: it.material_id, name: it.name, emco_sku: it.emco_sku, suggested_qty: it.need })) } });
+          // Van: persist a SEPARATE, tagged Draft "van-count order" (location_id = the
+          // van = the receive target). Van on_hand is LEFT at the counted value — NO
+          // auto-refill. The office reviews it (per-line Shop|EMCO source, trim), then:
+          //   • Shop lines  → pulled from shop now (shop → weekly reorder cascade).
+          //   • EMCO lines  → sent to EMCO; received straight INTO the van.
+          // Lines default to 'emco' (never touches shop until the office chooses Shop).
+          const ins = await env.DB.prepare(`INSERT INTO crm_inventory_purchase_orders (vendor_name, status, created_by, notes, location_id) VALUES ('EMCO','Draft',?,?,?)`).bind(actorId ?? null, name, Number(locationId)).run();
+          const poId = ins.meta?.last_row_id;
+          let total = 0;
+          const lineStmts = short.map((it) => {
+            const unit = Number(it.cost) || 0; const lt = unit * it.need; total += lt;
+            return env.DB.prepare(`INSERT INTO crm_inventory_po_items (po_id, material_id, qty_ordered, qty_received, vendor_part_number, unit_cost, line_total, source, fulfill_source) VALUES (?,?,?,0,?,?,?,'manual','emco')`).bind(poId, it.material_id, it.need, it.emco_sku ?? null, unit, lt);
+          });
+          for (let i = 0; i < lineStmts.length; i += 50) await env.DB.batch(lineStmts.slice(i, i + 50));
+          await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(Math.round(total * 100) / 100, poId).run();
+          return json({ ...base, order: { kind: "van_count_order", po_id: poId, location_id: Number(locationId), status: "Draft", name, lines: short.length } });
         }
 
         // Shop: a SEPARATE, editable Draft PO named via notes (poName renders it).
@@ -2748,6 +2791,121 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           catch (e) { results.push({ material_id: ln.material_id, result: "failed", error: String(e.message || e) }); }
         }
         return json({ ok: true, batch_id: batchId, results });
+      }
+
+      // 9g. GET /api/count-orders — the office's SEPARATE list of count-driven
+      //   orders (van-count orders: a PO with location_id set to the van). Kept
+      //   out of the weekly reorder/PO surfaces. Draft = awaiting review/commit;
+      //   Sent/Partial = EMCO lines outstanding; Received = fully in the van.
+      if (p === "/api/count-orders" && request.method === "GET") {
+        const rows = (await env.DB.prepare(
+          `SELECT po.id, po.status, po.total, po.notes, po.created_at, po.sent_at, po.received_at,
+                  po.location_id, loc.name AS location_name,
+                  (SELECT COUNT(*) FROM crm_inventory_po_items WHERE po_id=po.id) AS line_count,
+                  (SELECT COUNT(*) FROM crm_inventory_po_items pi WHERE pi.po_id=po.id AND pi.fulfill_source='shop') AS shop_lines,
+                  (SELECT COUNT(*) FROM crm_inventory_po_items pi WHERE pi.po_id=po.id AND (pi.fulfill_source IS NULL OR pi.fulfill_source='emco')) AS emco_lines
+             FROM crm_inventory_purchase_orders po
+             LEFT JOIN crm_inventory_locations loc ON loc.id = po.location_id
+            WHERE po.location_id IS NOT NULL AND po.location_id <> 1
+              AND po.status IN ('Draft','Sent','Partial')
+            ORDER BY po.id DESC`
+        ).all()).results || [];
+        return json({ orders: rows.map((o) => ({ ...o, name: o.notes || `count order #${o.id}` })) });
+      }
+
+      // 9h. GET /api/count-orders/:id — one count order + its lines, each with the
+      //   Shop|EMCO source, the SHOP's current on-hand (can we pull it now?), and
+      //   the VAN's current on-hand (what the count left it at).
+      const coGetMatch = p.match(/^\/api\/count-orders\/(\d+)$/);
+      if (coGetMatch && request.method === "GET") {
+        const poId = coGetMatch[1];
+        const po = await env.DB.prepare(
+          `SELECT po.id, po.status, po.total, po.notes, po.created_at, po.sent_at, po.received_at,
+                  po.location_id, loc.name AS location_name
+             FROM crm_inventory_purchase_orders po
+             LEFT JOIN crm_inventory_locations loc ON loc.id = po.location_id
+            WHERE po.id=?`
+        ).bind(poId).first();
+        if (!po || po.location_id == null || po.location_id === 1) return json({ error: "count order not found" }, 404);
+        const lines = (await env.DB.prepare(
+          `SELECT pi.id AS line_id, pi.material_id, m.name, m.emco_sku,
+                  pi.qty_ordered, pi.qty_received, pi.unit_cost, pi.line_total,
+                  COALESCE(pi.fulfill_source,'emco') AS fulfill_source,
+                  (SELECT on_hand FROM crm_inventory_stock WHERE location_id=1 AND material_id=pi.material_id) AS shop_on_hand,
+                  (SELECT on_hand FROM crm_inventory_stock WHERE location_id=?2 AND material_id=pi.material_id) AS van_on_hand
+             FROM crm_inventory_po_items pi
+             JOIN crm_materials m ON m.id=pi.material_id
+            WHERE pi.po_id=?1 ORDER BY m.category, m.name`
+        ).bind(poId, po.location_id).all()).results || [];
+        return json({ order: { ...po, name: po.notes || `count order #${po.id}`, lines } });
+      }
+
+      // 9i. PATCH /api/count-orders/line/:lineId  { source?, qty? } — set a line's
+      //   fulfill source (shop|emco) and/or its ordered qty. DRAFT only.
+      const coLineMatch = p.match(/^\/api\/count-orders\/line\/(\d+)$/);
+      if (coLineMatch && request.method === "PATCH") {
+        const lineId = Number(coLineMatch[1]);
+        const b = await request.json().catch(() => ({}));
+        const line = await env.DB.prepare(
+          `SELECT pi.id, pi.po_id, pi.unit_cost, po.status, po.location_id
+             FROM crm_inventory_po_items pi JOIN crm_inventory_purchase_orders po ON po.id=pi.po_id WHERE pi.id=?`
+        ).bind(lineId).first();
+        if (!line || line.location_id == null || line.location_id === 1) return json({ error: "count line not found" }, 404);
+        if (line.status !== "Draft") return json({ error: `order is ${line.status}; only a Draft can be edited` }, 409);
+        const sets = [], binds = [];
+        if (b.source != null) {
+          const src = b.source === "shop" ? "shop" : "emco";
+          sets.push("fulfill_source=?"); binds.push(src);
+        }
+        if (b.qty != null) {
+          const q = Math.max(1, Math.round(Number(b.qty) || 0));
+          const lt = Math.round((Number(line.unit_cost) || 0) * q * 100) / 100;
+          sets.push("qty_ordered=?", "line_total=?"); binds.push(q, lt);
+        }
+        if (!sets.length) return json({ error: "nothing to update" }, 400);
+        binds.push(lineId);
+        await env.DB.prepare(`UPDATE crm_inventory_po_items SET ${sets.join(", ")} WHERE id=?`).bind(...binds).run();
+        const tot = await env.DB.prepare(`SELECT ROUND(COALESCE(SUM(line_total),0),2) AS total FROM crm_inventory_po_items WHERE po_id=?`).bind(line.po_id).first();
+        await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(tot?.total ?? 0, line.po_id).run();
+        return json({ ok: true, line_id: lineId, po_id: line.po_id, total: tot?.total ?? 0 });
+      }
+
+      // 9j. POST /api/count-orders/:id/fill-shop  { actor_id } — execute the lines
+      //   marked source='shop': pull each from the shop INTO the van NOW (shop
+      //   depletes → surfaces on the weekly reorder), then REMOVE them from the
+      //   order so only EMCO lines remain to send. Idempotent per line (a line with
+      //   no shop stock is skipped + reported, never partially applied).
+      const coFillMatch = p.match(/^\/api\/count-orders\/(\d+)\/fill-shop$/);
+      if (coFillMatch && request.method === "POST") {
+        const poId = coFillMatch[1];
+        const b = await request.json().catch(() => ({}));
+        const actorId = b.actor_id ?? null;
+        const po = await env.DB.prepare(`SELECT id, status, location_id, notes FROM crm_inventory_purchase_orders WHERE id=?`).bind(poId).first();
+        if (!po || po.location_id == null || po.location_id === 1) return json({ error: "count order not found" }, 404);
+        if (po.status !== "Draft") return json({ error: `order is ${po.status}; fill-from-shop is a Draft step` }, 409);
+        const shopLines = (await env.DB.prepare(
+          `SELECT id AS line_id, material_id, qty_ordered FROM crm_inventory_po_items WHERE po_id=? AND fulfill_source='shop'`
+        ).bind(poId).all()).results || [];
+        const batchId = `count:${poId}`;
+        const note = po.notes || `van count ${poId}`;
+        const results = [];
+        for (const ln of shopLines) {
+          const qty = Number(ln.qty_ordered) || 0;
+          if (qty <= 0) continue;
+          try {
+            const r = await pullShopToVan(env, po.location_id, ln.material_id, qty, actorId, Number(poId), { batchId, note, reportShortfall: true });
+            results.push({ material_id: ln.material_id, ...r });
+            // Pull succeeded (fully or partially from shop) → drop the line from the order.
+            await env.DB.prepare(`DELETE FROM crm_inventory_po_items WHERE id=?`).bind(ln.line_id).run();
+          } catch (e) { results.push({ material_id: ln.material_id, result: "failed", error: String(e.message || e) }); }
+        }
+        const tot = await env.DB.prepare(`SELECT ROUND(COALESCE(SUM(line_total),0),2) AS total, COUNT(*) AS n FROM crm_inventory_po_items WHERE po_id=?`).bind(poId).first();
+        const remaining = tot?.n ?? 0;
+        // Every line filled from shop → nothing left to send to EMCO. Close the
+        // order (Received) so it drops off the active count-orders list.
+        if (remaining === 0) await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=0, status='Received', received_at=datetime('now') WHERE id=?`).bind(poId).run();
+        else await env.DB.prepare(`UPDATE crm_inventory_purchase_orders SET total=? WHERE id=?`).bind(tot?.total ?? 0, poId).run();
+        return json({ ok: true, batch_id: batchId, filled: results.length, remaining_lines: remaining, closed: remaining === 0, results });
       }
 
       // 8a-2. POST /api/reorder/dismiss  body { material_id, undo? }
@@ -2926,12 +3084,14 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const poId = recvMatch[1];
         const b = await request.json();
         const receipts = Array.isArray(b.lines) ? b.lines : [];
-        const po = await env.DB.prepare(`SELECT id, status FROM crm_inventory_purchase_orders WHERE id=?`).bind(poId).first();
+        const po = await env.DB.prepare(`SELECT id, status, location_id FROM crm_inventory_purchase_orders WHERE id=?`).bind(poId).first();
         if (!po) return json({ error: "not found" }, 404);
         if (!["Sent", "Partial"].includes(po.status)) {
           return json({ error: `PO is ${po.status}; only Sent/Partial can be received` }, 409);
         }
-        const WAREHOUSE_ID = 1;
+        // Receive TARGET = the PO's location (a van-count order carries its van id);
+        // shop reorders have NULL location_id → the warehouse (loc 1).
+        const targetLoc = po.location_id ?? 1;
         const batchId = crypto.randomUUID();   // one id for this receive action (undo target)
         const results = [];
         for (const rc of receipts) {
@@ -2944,10 +3104,15 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
               `SELECT id, material_id, qty_ordered, qty_received FROM crm_inventory_po_items WHERE id=? AND po_id=?`
             ).bind(lineId, poId).first();
             if (!line) throw new Error("line not found on this PO");
-            const srow = await env.DB.prepare(
+            let srow = await env.DB.prepare(
               `SELECT id, on_hand FROM crm_inventory_stock WHERE location_id=? AND material_id=?`
-            ).bind(WAREHOUSE_ID, line.material_id).first();
-            if (!srow) throw new Error("no shop stock row");
+            ).bind(targetLoc, line.material_id).first();
+            if (!srow) {
+              // Receiving into a location that has no stock row for this item (a van
+              // ordered a part it didn't stock before) — create the row at 0 first.
+              const si = await env.DB.prepare(`INSERT INTO crm_inventory_stock (location_id, material_id, on_hand, min_qty, max_qty) VALUES (?,?,0,0,0)`).bind(targetLoc, line.material_id).run();
+              srow = { id: si.meta?.last_row_id, on_hand: 0 };
+            }
             const newReceived = (line.qty_received ?? 0) + recvQty;
             const newOnHand = (srow.on_hand ?? 0) + recvQty;
             await env.DB.batch([
@@ -2959,7 +3124,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
                 `INSERT INTO crm_inventory_movements
                    (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id)
                  VALUES (?,?,?,?,?,?,?,?)`
-              ).bind(line.material_id, WAREHOUSE_ID, recvQty, "po_receive", Number(poId), `received PO #${poId}`, b.created_by ?? 8, batchId),
+              ).bind(line.material_id, targetLoc, recvQty, "po_receive", Number(poId), `received PO #${poId}`, b.created_by ?? 8, batchId),
             ]);
             results.push({
               line_id: line.id, material_id: line.material_id, received: recvQty,
@@ -3004,7 +3169,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
       if (p === "/api/reorder/pos" && request.method === "GET") {
         const status = url.searchParams.get("status");
         const arr = status ? status.split(",").map((s) => s.trim()).filter(Boolean) : null;
-        const where = arr ? `WHERE status IN (${arr.map(() => "?").join(",")})` : "";
+        // Shop POs only — van-count orders (location_id set) live in their own section.
+        const locGuard = "(location_id IS NULL OR location_id = 1)";
+        const where = arr ? `WHERE status IN (${arr.map(() => "?").join(",")}) AND ${locGuard}` : `WHERE ${locGuard}`;
         const stmt = env.DB.prepare(
           `SELECT po.id, po.status, po.total, po.created_at, po.sent_at, po.received_at, po.notes,
                   (SELECT COUNT(*) FROM crm_inventory_po_items WHERE po_id=po.id) AS line_count,
@@ -3045,6 +3212,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              JOIN crm_inventory_purchase_orders po ON po.id = pi.po_id
              JOIN crm_materials m ON m.id = pi.material_id
             WHERE po.status IN ('Sent','Partial') AND pi.qty_received < pi.qty_ordered
+              AND (po.location_id IS NULL OR po.location_id = 1)  -- shop backorders only
             ORDER BY po.sent_at, m.name`
         ).all()).results || [];
         return json({ items: rows });

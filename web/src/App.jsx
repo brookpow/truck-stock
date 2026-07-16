@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
   scanReceipt, savePurchase, saveOverheadPurchase, restockFromShop, getJobPurchases, deletePurchase, patchPurchase,
-  getByCategory, createRequest, receiptPhotoUrl,
+  getByCategory, createRequest, receiptPhotoUrl, createRestockRequest, getRestockRequests, dismissRestockRequest,
   startCount, getCurrentCount, saveCountItems, finishCount, discardCount,
   techList, techLogin, getTechToken, setTechToken, setOnAuthLost } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
@@ -424,6 +424,7 @@ function Capture({ tech, job, onBack }) {
   const [reqQty, setReqQty] = useState("");
   const [reqNotes, setReqNotes] = useState("");
   const [reqBusy, setReqBusy] = useState(false);
+  const [restockPrompt, setRestockPrompt] = useState(null); // material to ask "restock?" — NON-BLOCKING
   const timer = useRef(null);
   const noteTimer = useRef(null);
 
@@ -523,6 +524,10 @@ function Capture({ tech, job, onBack }) {
       } else {
         refresh();
       }
+      // NON-BLOCKING restock prompt: the log above already stands. If this item
+      // asks "restock?", surface a sheet AFTER the fact — dismissing it (swipe,
+      // background, tap-away) means No and creates nothing. Never gate the log.
+      if (m.prompt_restock) setRestockPrompt(m);
     } catch (e) {
       alert("Couldn't save: " + (e.message || e));
     } finally {
@@ -769,6 +774,27 @@ function Capture({ tech, job, onBack }) {
           {purchases.map((pu) => (
             <ReceiptRow key={pu.id} jobId={job.id} purchase={pu} onChanged={refresh} />
           ))}
+        </div>
+      )}
+
+      {/* NON-BLOCKING restock sheet — the log already stands. Tap-away / No / a
+          swipe / backgrounding all mean No (nothing created). Only Yes posts a
+          restock request. Default focus is No so a stray tap never over-orders. */}
+      {restockPrompt && (
+        <div style={styles.countOverlay} onClick={() => setRestockPrompt(null)}>
+          <div style={styles.countModal} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.countModalTitle}>Restock this on your van?</div>
+            <div style={styles.sub}>{restockPrompt.name} — added to the job. Want to pull a fresh {restockPrompt.purchase_unit || "one"} from the shop next restock?</div>
+            <div style={styles.restockBtnRow}>
+              <button style={styles.restockNo} autoFocus onClick={() => setRestockPrompt(null)}>No</button>
+              <button style={styles.restockYes} onClick={() => {
+                const m = restockPrompt; setRestockPrompt(null);
+                createRestockRequest(tech.st_tech_id, m.id, 1)
+                  .then(() => flashNote(`↺ ${m.name} added to your restock list`))
+                  .catch(() => flashNote("Couldn't add to restock list — try at restock"));
+              }}>Yes, restock it</button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -1290,6 +1316,7 @@ function FromShopRestock({ tech, onBack }) {
   const [openCat, setOpenCat] = useState(null);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(null);        // per-item results after submit
+  const [suggested, setSuggested] = useState([]); // open restock-requests (the "yes" from job prompts)
   const timer = useRef(null);
 
   useEffect(() => {
@@ -1299,6 +1326,7 @@ function FromShopRestock({ tech, onBack }) {
     return () => clearTimeout(timer.current);
   }, [q]);
   useEffect(() => { getByCategory().then((r) => setCategories(r.categories || [])).catch(() => {}); }, []);
+  useEffect(() => { getRestockRequests(tech.st_tech_id).then(setSuggested).catch(() => setSuggested([])); }, [tech.st_tech_id]);
 
   function addToCart(m) {
     setCart((c) => {
@@ -1357,6 +1385,28 @@ function FromShopRestock({ tech, onBack }) {
       </div>
       <h1 style={styles.h1}>Restock from shop</h1>
       <p style={styles.sub}>Pick what you grabbed from the shop. This moves stock <b>shop → your van</b> — no job, no purchase.</p>
+
+      {suggested.length > 0 && (
+        <div style={styles.fsSuggest}>
+          <div style={styles.sectionLabel}>↺ Suggested to restock ({suggested.length})</div>
+          <p style={styles.fsSuggestSub}>From items you said "yes, restock" on jobs. Tap to add what you're grabbing.</p>
+          {suggested.map((s) => {
+            const inCart = cart.some((x) => x.material_id === s.material_id);
+            return (
+              <button key={s.id} disabled={inCart}
+                style={{ ...styles.resultRow, width: "100%", cursor: inCart ? "default" : "pointer", opacity: inCart ? 0.5 : 1 }}
+                onClick={() => addToCart({ id: s.material_id, name: s.name })}>
+                <span>{s.name}{s.emco_sku ? <span style={styles.muted}> · {s.emco_sku}</span> : null}</span>
+                <span style={styles.muted}>{inCart ? "added ✓" : "add +"}</span>
+              </button>
+            );
+          })}
+          <button style={styles.fsGrabAll} onClick={() => setCart((c) => {
+            const have = new Set(c.map((x) => x.material_id));
+            return [...c, ...suggested.filter((s) => !have.has(s.material_id)).map((s) => ({ material_id: s.material_id, name: s.name, qty: s.qty || 1 }))];
+          })}>Add all suggested</button>
+        </div>
+      )}
 
       <input style={styles.input} placeholder="Search the catalog…" value={q} onChange={(e) => setQ(e.target.value)} />
       {results.map((m) => (
@@ -1471,6 +1521,9 @@ const styles = {
   countBtnDiscard: { flex: "none", width: 52, height: 52, fontSize: 18, fontWeight: 700, background: C.redWash, color: C.redInk, border: "none", borderRadius: 12, cursor: "pointer" },
   countOverlay: { position: "fixed", inset: 0, background: "rgba(20,21,26,.4)", zIndex: 50, display: "flex", alignItems: "flex-end", justifyContent: "center", padding: 0 },
   countModal: { ...card, width: "100%", maxWidth: 520, padding: "20px 18px calc(18px + env(safe-area-inset-bottom))", borderRadius: "18px 18px 0 0" },
+  restockBtnRow: { display: "flex", gap: 10, marginTop: 16 },
+  restockNo: { flex: "none", minWidth: 96, height: 52, fontSize: 16, fontWeight: 700, background: C.sunk, color: C.ink2, border: `1px solid ${C.hair}`, borderRadius: 14, cursor: "pointer" },
+  restockYes: { flex: 1, height: 52, fontSize: 16, fontWeight: 700, background: C.green, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer" },
   countModalTitle: { fontFamily: DISP, fontSize: 20, fontWeight: 800, letterSpacing: "-.02em", color: C.ink, marginBottom: 6 },
   countDone: { fontSize: 15, fontWeight: 600, color: C.greenInk, background: C.greenWash, borderRadius: 12, padding: "14px 16px", margin: "14px 0" },
   countPullRow: { display: "flex", alignItems: "center", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.hair}`, fontSize: 15, color: C.ink },
@@ -1486,6 +1539,9 @@ const styles = {
   rcptDel: { width: 34, height: 34, flex: "none", marginLeft: "auto", fontSize: 18, lineHeight: "34px", border: "none", borderRadius: 9, background: C.redWash, color: C.redInk, cursor: "pointer", padding: 0 },
   resultRow: { ...card, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 14px", marginBottom: 8, borderRadius: 14 },
   catRow: { ...card, display: "block", width: "100%", textAlign: "left", padding: "14px", marginBottom: 8, borderRadius: 14, fontSize: 15, fontWeight: 500, color: C.ink, cursor: "pointer" },
+  fsSuggest: { ...card, marginTop: 4, marginBottom: 12, padding: "12px 14px", borderRadius: 16, border: `1px solid ${C.greenWash}`, background: C.greenWash },
+  fsSuggestSub: { fontSize: 13, color: C.ink3, margin: "0 4px 8px" },
+  fsGrabAll: { width: "100%", height: 44, marginTop: 8, fontSize: 14, fontWeight: 700, background: C.green, color: "#fff", border: "none", borderRadius: 12, cursor: "pointer" },
   fsCart: { ...card, marginTop: 16, padding: "14px", borderRadius: 16 },
   fsCartRow: { display: "flex", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: `1px solid ${C.hair}` },
   fsCartName: { flex: 1, fontSize: 15, color: C.ink },

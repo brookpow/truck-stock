@@ -170,6 +170,32 @@ export async function restockFromShop(stTechId, items) {
   return d;
 }
 
+// Opt-in restock request (the "Restock this on your van?" Yes). Fire-and-forget
+// from the caller's view — the material was already logged; this just adds a
+// pull line. Worker resolves the van from tech_id and DEDUPS (one open per
+// van+material). Never block the logging flow on this.
+export async function createRestockRequest(techId, materialId, qty = 1) {
+  const r = await fetch(`${API}/api/restock-requests`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tech_id: techId, material_id: materialId, qty, actor_id: techId }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("restock-request " + r.status));
+  return d;
+}
+// Open restock-requests for this tech's van (the FromShop "suggested" section).
+export async function getRestockRequests(techId) {
+  const r = await fetch(`${API}/api/restock-requests?tech_id=${encodeURIComponent(techId)}`);
+  if (!r.ok) throw new Error("restock-requests " + r.status);
+  return (await r.json()).requests || [];
+}
+export async function dismissRestockRequest(id) {
+  const r = await fetch(`${API}/api/restock-requests/${id}`, { method: "DELETE" });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("dismiss " + r.status));
+  return d;
+}
+
 // GET a job's saved receipts -> { purchases:[{ id, supplier, subtotal, tax,
 // receipt_total, created_at, lines:[matched materials] }] }.
 export async function getJobPurchases(jobId) {

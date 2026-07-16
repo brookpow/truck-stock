@@ -128,15 +128,16 @@ async function pullShopToVan(env, vanId, mid, qty, operator, ref, opts = {}) {
 
   const shopBefore = whRow.on_hand ?? 0;
   const batchId = opts.batchId ?? null;   // groups every leg of one confirm action (for undo)
+  const actorId = opts.actorId ?? null;   // WHO pulled (identity layer) — distinct from created_by
   await env.DB.batch([
     env.DB.prepare(`UPDATE crm_inventory_stock SET on_hand = ?, last_restocked = datetime('now'), modified_at = datetime('now') WHERE id = ?`)
       .bind((vanRow.on_hand ?? 0) + qty, vanRow.id),
-    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id) VALUES (?,?,?,?,?,?,?,?)`)
-      .bind(mid, vanId, qty, "transfer_in", ref, note, operator, batchId),
+    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id, actor_id) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .bind(mid, vanId, qty, "transfer_in", ref, note, operator, batchId, actorId),
     env.DB.prepare(`UPDATE crm_inventory_stock SET on_hand = ?, modified_at = datetime('now') WHERE id = ?`)
       .bind(shopBefore - qty, whRow.id),   // shop may go negative — recount/reorder signal
-    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id) VALUES (?,?,?,?,?,?,?,?)`)
-      .bind(mid, WAREHOUSE_ID, -qty, "transfer_out", ref, note, operator, batchId),
+    env.DB.prepare(`INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id, actor_id) VALUES (?,?,?,?,?,?,?,?,?)`)
+      .bind(mid, WAREHOUSE_ID, -qty, "transfer_out", ref, note, operator, batchId, actorId),
   ]);
 
   const out = { material_id: mid, result: "pulled_shop", quantity: qty };
@@ -149,7 +150,7 @@ async function pullShopToVan(env, vanId, mid, qty, operator, ref, opts = {}) {
 // restores on_hand, and for PO receive decrements qty_received + recomputes PO
 // status. Idempotent: undone_at blocks double-undo. Returns a summary + warnings
 // (e.g. on_hand went negative because stock was used/moved since the restock).
-async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {}) {
+async function undoBatch(env, batchId, { materialId = null, operator = 8, actorId = null } = {}) {
   if (!batchId) return { ok: false, error: "batch_id required" };
   const binds = materialId != null ? [batchId, materialId] : [batchId];
   const legs = (await env.DB.prepare(
@@ -163,7 +164,7 @@ async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {})
   if (!work.length) return { ok: false, error: "nothing_to_undo", message: "already undone, or no such batch/line" };
 
   const revBatch = `undo:${batchId}`;
-  const warnings = [], poIds = new Set(), stmts = [];
+  const warnings = [], poIds = new Set(), stmts = [], reopen = [];
   for (const leg of work) {
     const reverseQty = -leg.qty_change;   // opposite sign restores stock
     const srow = await env.DB.prepare(
@@ -178,10 +179,14 @@ async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {})
                     : leg.reason === "transfer_out" ? "transfer_in"
                     : "manual";   // po_receive: CHECK has no po_unreceive
     if (leg.reason === "po_receive") poIds.add(leg.reference_id);
+    // Reversing a shop→van pull removes it from the VAN (the transfer_in leg).
+    // If that pull had fulfilled a restock request, the tech still wants the item
+    // (just not that pull) — reopen it below.
+    if (leg.reason === "transfer_in") reopen.push({ location_id: leg.location_id, material_id: leg.material_id });
     stmts.push(env.DB.prepare(
-      `INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id)
-       VALUES (?,?,?,?,?,?,?,?)`
-    ).bind(leg.material_id, leg.location_id, reverseQty, revReason, leg.reference_id, `undo of batch ${batchId}`, operator, revBatch));
+      `INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, created_by, batch_id, actor_id)
+       VALUES (?,?,?,?,?,?,?,?,?)`
+    ).bind(leg.material_id, leg.location_id, reverseQty, revReason, leg.reference_id, `undo of batch ${batchId}`, operator, revBatch, actorId));
     if (leg.reason === "po_receive") {
       stmts.push(env.DB.prepare(
         `UPDATE crm_inventory_po_items SET qty_received = MAX(0, COALESCE(qty_received,0) - ?) WHERE po_id=? AND material_id=?`
@@ -190,6 +195,16 @@ async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {})
     stmts.push(env.DB.prepare(`UPDATE crm_inventory_movements SET undone_at=datetime('now') WHERE id=?`).bind(leg.id));
   }
   await env.DB.batch(stmts);
+
+  // Reopen any restock request this pull had fulfilled (van still under-stocked).
+  // Only if nothing's open for that van+material (the partial-unique index allows
+  // one open per pair) — reopen the most recently fulfilled.
+  for (const c of reopen) {
+    const openEx = await env.DB.prepare(`SELECT 1 FROM crm_restock_requests WHERE location_id=? AND material_id=? AND fulfilled_at IS NULL LIMIT 1`).bind(c.location_id, c.material_id).first();
+    if (openEx) continue;
+    const last = await env.DB.prepare(`SELECT id FROM crm_restock_requests WHERE location_id=? AND material_id=? AND fulfilled_at IS NOT NULL ORDER BY fulfilled_at DESC LIMIT 1`).bind(c.location_id, c.material_id).first();
+    if (last) await env.DB.prepare(`UPDATE crm_restock_requests SET fulfilled_at=NULL WHERE id=?`).bind(last.id).run();
+  }
 
   // Recompute status for any PO whose receive was reversed.
   const po = [];
@@ -203,6 +218,21 @@ async function undoBatch(env, batchId, { materialId = null, operator = 8 } = {})
     po.push({ po_id: poId, status });
   }
   return { ok: true, batch_id: batchId, legs_reversed: work.length, reversing_batch: revBatch, warnings, po };
+}
+
+// A stock-moving edit to a PAST PULL must be blocked while a count is open on the
+// van: the count froze expected_qty at snapshot time and computes variance vs the
+// CURRENT on_hand at finish, so moving stock mid-count corrupts both. These two
+// helpers gate the undo/add-line endpoints on the van's open-count state.
+async function vanHasOpenCount(env, locationId) {
+  if (locationId == null) return false;
+  const r = await env.DB.prepare(`SELECT id FROM crm_inventory_counts WHERE location_id=? AND status='InProgress' LIMIT 1`).bind(locationId).first();
+  return !!r;
+}
+async function batchVanLocation(env, batchId) {
+  // The van a pull batch stocked = the location of its transfer_in leg.
+  const r = await env.DB.prepare(`SELECT location_id FROM crm_inventory_movements WHERE batch_id=? AND reason='transfer_in' ORDER BY id DESC LIMIT 1`).bind(batchId).first();
+  return r ? r.location_id : null;
 }
 
 // ── Reorder PO coverage naming ──────────────────────────────────────────────
@@ -1006,15 +1036,16 @@ export default {
                 ).bind(after, row.id),
                 env.DB.prepare(
                   `INSERT INTO crm_inventory_movements
-                     (material_id, location_id, qty_change, reason, reference_id, created_by)
-                   VALUES (?,?,?,?,?,?)`
+                     (material_id, location_id, qty_change, reason, reference_id, created_by, actor_id)
+                   VALUES (?,?,?,?,?,?,?)`
                 ).bind(
                   b.material_id,
                   van.id,
                   -b.quantity,
                   "job_usage",
                   jobMaterialId,        // reference back to the crm_job_materials row
-                  b.tech_id ?? null
+                  b.tech_id ?? null,
+                  b.actor_id ?? null    // WHO logged it — office person when logged FROM the office
                 ),
               ]);
               stock = {
@@ -1983,10 +2014,10 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
             if (mid == null) throw new Error("material_id required");
 
             if (action === "pull_shop") {
-              // Shared transfer engine (factored). Office keeps its behavior:
-              // van/shop row required — a throw becomes a "failed" result below,
-              // no auto-create, no shortfall field.
-              results.push(await pullShopToVan(env, locationId, mid, qty, operator, ref, { batchId }));
+              // Shared transfer engine. autoCreateVan so an office-ADDED item the
+              // van didn't stock yet (Zone 1 "+ Add item") pulls cleanly — it just
+              // creates the van's 0/0/0 row first. Shop row still required.
+              results.push(await pullShopToVan(env, locationId, mid, qty, operator, ref, { batchId, autoCreateVan: true }));
 
             } else if (action === "pull_other") {
               // Van += qty only. Shop UNTOUCHED — parts came from loose extras,
@@ -2040,6 +2071,19 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
             results.push({ material_id: mid, result: "failed", error: String(e.message || e) });
           }
         }
+
+        // Close any open restock-requests for materials just PULLED onto this van
+        // (a Zone-1 request line the office pulled is now fulfilled). shop_out/skip
+        // leave the request open — the tech still wants it.
+        try {
+          const pulledMids = results.filter((r) => r.result === "pulled_shop" || r.result === "pulled_other").map((r) => r.material_id);
+          if (pulledMids.length) {
+            const ph = pulledMids.map(() => "?").join(",");
+            await env.DB.prepare(
+              `UPDATE crm_restock_requests SET fulfilled_at=datetime('now') WHERE location_id=? AND fulfilled_at IS NULL AND material_id IN (${ph})`
+            ).bind(locationId, ...pulledMids).run();
+          }
+        } catch (_) { /* request cleanup is best-effort */ }
 
         // Return the van's updated on_hand for each material (chunked to stay
         // under D1's SQL-variable limit).
@@ -2173,8 +2217,32 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
       if (undoMatch && request.method === "POST") {
         const batchId = decodeURIComponent(undoMatch[1]);
         const body = await request.json().catch(() => ({}));
-        const res = await undoBatch(env, batchId, { materialId: body.material_id ?? null, operator: body.created_by ?? 8 });
+        // Guard: no editing a past pull while a count is open on its van.
+        const vanLoc = await batchVanLocation(env, batchId);
+        if (await vanHasOpenCount(env, vanLoc)) return json({ error: "count_in_progress", message: "A count is open on this van — finish or discard it before editing past pulls." }, 409);
+        const res = await undoBatch(env, batchId, { materialId: body.material_id ?? null, operator: body.created_by ?? 8, actorId: body.actor_id ?? null });
         return json(res, res.ok ? 200 : 409);
+      }
+
+      // POST /api/restock/batch/:batchId/add-line  body { material_id, qty, actor_id? }
+      // Counter-correction "forgot a fitting": pull ONE more item shop→van INTO an
+      // existing pull batch (same batch_id, so the order stays one coherent record),
+      // stock moved both ways, actor stamped. Blocked while a count is open.
+      const addLineMatch = p.match(/^\/api\/restock\/batch\/([^/]+)\/add-line$/);
+      if (addLineMatch && request.method === "POST") {
+        const batchId = decodeURIComponent(addLineMatch[1]);
+        const body = await request.json().catch(() => ({}));
+        const mid = body.material_id;
+        const qty = Number(body.qty) || 0;
+        if (mid == null || qty <= 0) return json({ error: "material_id and qty > 0 required" }, 400);
+        const vanLoc = await batchVanLocation(env, batchId);
+        if (vanLoc == null) return json({ error: "batch has no pull on any van" }, 404);
+        if (await vanHasOpenCount(env, vanLoc)) return json({ error: "count_in_progress", message: "A count is open on this van — finish or discard it before editing past pulls." }, 409);
+        const actorId = body.actor_id ?? null;
+        try {
+          const r = await pullShopToVan(env, vanLoc, mid, qty, actorId ?? 8, null, { batchId, note: `added to pull ${batchId}`, reportShortfall: true, actorId });
+          return json({ ok: true, batch_id: batchId, line: r });
+        } catch (e) { return json({ error: String(e.message || e) }, 500); }
       }
 
       // --- 5c. Tech-initiated restock FROM SHOP (no job, no purchase) -----

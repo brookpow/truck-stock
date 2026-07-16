@@ -2017,7 +2017,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
               // Shared transfer engine. autoCreateVan so an office-ADDED item the
               // van didn't stock yet (Zone 1 "+ Add item") pulls cleanly — it just
               // creates the van's 0/0/0 row first. Shop row still required.
-              results.push(await pullShopToVan(env, locationId, mid, qty, operator, ref, { batchId, autoCreateVan: true }));
+              results.push(await pullShopToVan(env, locationId, mid, qty, operator, ref, { batchId, autoCreateVan: true, actorId: operator }));
 
             } else if (action === "pull_other") {
               // Van += qty only. Shop UNTOUCHED — parts came from loose extras,
@@ -2274,7 +2274,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           const qty = Number(it.quantity ?? it.qty) || 0;
           try {
             results.push(await pullShopToVan(env, van.id, it.material_id, qty, operator, refBase + i,
-              { autoCreateVan: true, reportShortfall: true, batchId, note: `tech restock from shop (tech ${stTechId})` }));
+              { autoCreateVan: true, reportShortfall: true, batchId, note: `tech restock from shop (tech ${stTechId})`, actorId: operator }));
           } catch (e) {
             results.push({ material_id: it.material_id, result: "failed", error: String(e.message || e) });
           }
@@ -2375,7 +2375,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const items = Array.isArray(body.items) ? body.items : null;
         if (!items) return json({ error: "items array required" }, 400);
         const operator = body.created_by ?? 8; // crm_users.id — Warehouse Manager
-        const results = await saveLocationStock(env, 1, items, operator, "shop count");
+        const results = await saveLocationStock(env, 1, items, operator, "shop count", { actorId: operator });
         return json({ location_id: 1, results });
       }
 
@@ -2404,7 +2404,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           if (!items) return json({ error: "items array required" }, 400);
           const operator = body.created_by ?? 8; // Warehouse Manager
           const note = (loc.type === "shop" ? "shop" : "van") + " count";
-          const results = await saveLocationStock(env, locId, items, operator, note);
+          const results = await saveLocationStock(env, locId, items, operator, note, { actorId: operator });
           return json({ location_id: locId, location_name: loc.name, results });
         }
       }
@@ -2928,7 +2928,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         for (const ln of lines) {
           const qty = Number(ln.qty) || 0;
           if (ln.material_id == null || qty <= 0) continue;
-          try { results.push(await pullShopToVan(env, cnt.location_id, ln.material_id, qty, actorId, Number(countId), { batchId, note, reportShortfall: true })); }
+          try { results.push(await pullShopToVan(env, cnt.location_id, ln.material_id, qty, actorId, Number(countId), { batchId, note, reportShortfall: true, actorId })); }
           catch (e) { results.push({ material_id: ln.material_id, result: "failed", error: String(e.message || e) }); }
         }
         return json({ ok: true, batch_id: batchId, results });
@@ -3034,7 +3034,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           const qty = Number(ln.qty_ordered) || 0;
           if (qty <= 0) continue;
           try {
-            const r = await pullShopToVan(env, po.location_id, ln.material_id, qty, actorId, Number(poId), { batchId, note, reportShortfall: true });
+            const r = await pullShopToVan(env, po.location_id, ln.material_id, qty, actorId, Number(poId), { batchId, note, reportShortfall: true, actorId });
             results.push({ material_id: ln.material_id, ...r });
             // Pull succeeded (fully or partially from shop) → drop the line from the order.
             await env.DB.prepare(`DELETE FROM crm_inventory_po_items WHERE id=?`).bind(ln.line_id).run();

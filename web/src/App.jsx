@@ -505,6 +505,7 @@ function Capture({ tech, job, onBack }) {
         material_id: m.id,
         quantity: qty,
         tech_id: tech.st_tech_id,
+        actor_id: tech.st_tech_id,   // identity layer: WHO logged it (the tech themselves)
         job_number: job.num,
         // Display-only fields (underscore-prefixed). The worker ignores unknown
         // keys, so these ride along only to render the queued item optimistically

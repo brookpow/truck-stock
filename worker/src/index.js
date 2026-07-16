@@ -2659,7 +2659,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           `SELECT s.material_id, m.name, m.emco_sku, m.cost, s.on_hand, s.max_qty,
                   (s.max_qty - s.on_hand) AS raw_short,
                   COALESCE((
-                    SELECT SUM(pi.qty_ordered - pi.qty_received)
+                    SELECT SUM(MAX(0, pi.qty_ordered - pi.qty_received))   -- clamp: an over-received line (received > ordered) must NOT credit against another line's shortfall
                       FROM crm_inventory_po_items pi
                       JOIN crm_inventory_purchase_orders po ON po.id = pi.po_id
                      WHERE pi.material_id = s.material_id

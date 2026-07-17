@@ -291,6 +291,37 @@ function Jobs({ tech, onSignOut }) {
       )}
       {err && <div style={styles.error}>Couldn't load today's jobs — enter the job number below.</div>}
 
+      {/* Escape hatch — kept directly under the job list and always visible.
+          A job can be missing here for real reasons: sync lag, or being dispatched
+          to help on a job another tech already started (the co-assignment lands late).
+          A tech whose expected job simply isn't listed needs to find the way to log
+          against it by number without hunting — so this sits up top, not buried below
+          the action rows. */}
+      {!manual && (
+        <button style={styles.manualToggleCard} className="fm-press" onClick={() => setManual(true)}>
+          <span style={styles.manualToggleTitle}>Job not on your list?</span>
+          <span style={styles.manualToggleSub}>Log materials by ServiceTitan job number →</span>
+        </button>
+      )}
+      {manual && (
+        <div style={styles.manualCard}>
+          <p style={styles.sub}>Enter the ServiceTitan job number to log materials against it.</p>
+          <input
+            style={styles.input}
+            inputMode="numeric"
+            placeholder="e.g. 480231"
+            value={manualId}
+            onChange={(e) => setManualId(e.target.value)}
+          />
+          <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+            <button style={styles.primary} onClick={openManual}>Open job</button>
+            {jobs && jobs.length > 0 && (
+              <button style={styles.linkBtn} onClick={() => setManual(false)}>Cancel</button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Scan a receipt — one tap from home. The tech confirms the scan, then
           picks a destination (a job, or shop/overhead) — no silent bucket. */}
       <button style={styles.actRow} className="fm-press" onClick={() => setScanOpen(true)}>
@@ -333,29 +364,6 @@ function Jobs({ tech, onSignOut }) {
           <span style={styles.actDesc}>Pulled stock to my van</span>
         </span>
       </button>
-
-      {/* Manual entry: auto-shown when there are no jobs / fallback="manual",
-          and reachable via the toggle for a job that isn't on the list. */}
-      {!manual && jobs && jobs.length > 0 && (
-        <button style={styles.manualToggle} onClick={() => setManual(true)}>
-          Different job? Enter a number
-        </button>
-      )}
-      {manual && (
-        <div style={{ marginTop: 16 }}>
-          <p style={styles.sub}>
-            Enter the ServiceTitan job number to log materials against it.
-          </p>
-          <input
-            style={styles.input}
-            inputMode="numeric"
-            placeholder="e.g. 480231"
-            value={manualId}
-            onChange={(e) => setManualId(e.target.value)}
-          />
-          <button style={styles.primary} onClick={openManual}>Open job</button>
-        </div>
-      )}
 
       {/* Recent / finished tier — de-emphasized, below everything. Paused/Done
           jobs from the last 3 days; tap to log a forgotten material. */}
@@ -1495,6 +1503,10 @@ const styles = {
   actTitle: { fontWeight: 700, fontSize: 14.5, color: C.ink },
   actDesc: { fontSize: 12, color: C.ink3, marginTop: 1 },
   manualToggle: { background: "none", border: "none", color: C.blue, fontSize: 14, padding: "12px 0", marginTop: 6, cursor: "pointer", textAlign: "left", display: "block", fontWeight: 600 },
+  manualToggleCard: { ...card, display: "block", width: "100%", textAlign: "left", cursor: "pointer", marginTop: 11, padding: "13px 16px", borderRadius: 14, border: `1px dashed ${C.blue}`, background: C.blueWash },
+  manualToggleTitle: { display: "block", fontSize: 15, fontWeight: 700, color: C.blueInk },
+  manualToggleSub: { display: "block", fontSize: 13, color: C.blueInk, opacity: 0.82, marginTop: 2 },
+  manualCard: { ...card, marginTop: 11, padding: "14px 16px", borderRadius: 14 },
   overheadNote: { fontSize: 13, color: C.amberInk, background: C.amberWash, borderRadius: 12, padding: "10px 12px", margin: "0 0 12px" },
   input: { ...ctl, width: "100%", height: 52, fontSize: 16, padding: "0 14px", marginBottom: 10 },
   primary: { width: "100%", height: 52, fontSize: 16, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer" },

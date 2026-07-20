@@ -249,7 +249,18 @@ function Jobs({ tech, onSignOut }) {
   const jobs = data ? data.jobs : null;
   const recent = (data && data.recent) || [];
   const working = (jobs || []).filter((j) => j.status === "Working");
-  const upcoming = (jobs || []).filter((j) => j.status !== "Working");
+  // FOCUS view: render only the CURRENT job(s); the forward schedule is hidden.
+  //   - Any Working jobs are "current" — the tech is physically on them, so we
+  //     NEVER hide one (multi-dispatch shows all Working, or logging to it breaks).
+  //   - If nothing is Working yet (start of day), fall back to the imminent
+  //     upcoming (earliest start_date) so the forward view is never empty.
+  // The rest of the day's upcoming is hidden (no show-all toggle). This is a
+  // declutter view, NOT a lockout: the feed (`data`) is untouched, so history,
+  // the scan-destination picker, and "enter by number" still reach every job.
+  const upcomingSorted = (jobs || [])
+    .filter((j) => j.status !== "Working")
+    .sort((a, b) => String(a.start || "").localeCompare(String(b.start || "")));
+  const current = working.length ? working : (upcomingSorted[0] ? [upcomingSorted[0]] : []);
 
   return (
     <div style={styles.screen}>
@@ -274,16 +285,10 @@ function Jobs({ tech, onSignOut }) {
 
       {!jobs && !err && <div style={styles.muted}>Loading jobs…</div>}
 
-      {working.length > 0 && (
+      {current.length > 0 && (
         <>
           <div style={styles.sectionLabel}>Current</div>
-          {working.map((j) => <JobCard key={j.id} job={j} current onTap={() => setActive(j)} />)}
-        </>
-      )}
-      {upcoming.length > 0 && (
-        <>
-          <div style={styles.sectionLabel}>Upcoming</div>
-          {upcoming.map((j) => <JobCard key={j.id} job={j} onTap={() => setActive(j)} />)}
+          {current.map((j) => <JobCard key={j.id} job={j} current onTap={() => setActive(j)} />)}
         </>
       )}
       {jobs && jobs.length === 0 && !err && (

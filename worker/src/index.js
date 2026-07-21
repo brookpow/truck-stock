@@ -839,21 +839,56 @@ export default {
       // Matches name, code, or EMCO SKU. Returns cost so the capture screen
       // can freeze it onto the job line at time of use.
       if (p === "/api/materials/search" && request.method === "GET") {
-        const q = (url.searchParams.get("q") || "").trim();
-        if (q.length < 2) return json([]); // wait for 2+ chars
-        const like = `%${q}%`;
-        // search_terms is a dedicated field for tech vocabulary ("elbow" -> "90 copper ell").
-        // is_active filters out retired catalog items. unit/category help the capture UI.
+        const raw = (url.searchParams.get("q") || "").trim();
+        if (raw.length < 2) return json([]); // wait for 2+ chars
+        // Tokenized + size-aware search. Split on whitespace; EVERY token must
+        // match (AND) against a punctuation-normalized, space-padded haystack
+        // (name + search_terms + sku/code, lowercased, " -> space). A word token
+        // is a plain substring; a SIZE token (2, 1.5, 1/2, 3/4, 90) is space-
+        // ANCHORED (`% 2 %`) so "2 abs" hits 2" ABS but NEVER 1/2" or 1.25" ABS
+        // (no half-inch bleed). Order-independent by construction: "abs 90" == "90 abs".
+        // search_terms carries tech vocabulary ("elbow" -> "90 copper ell").
+        const qlower = raw.toLowerCase();
+        const tokens = qlower.split(/\s+/)
+          .map((t) => t.replace(/[%_]/g, ""))   // strip LIKE wildcards from user input
+          .filter(Boolean).slice(0, 6);
+        if (!tokens.length) return json([]);
+        // Two haystacks (built from STATIC column names, lowercased, " -> space,
+        // space-wrapped so size tokens anchor on ` `):
+        //   HAY_FULL — name + search_terms + sku/code: for WORD tokens (vocabulary).
+        //   HAY_NAME — name ONLY: for SIZE tokens, so a size annotation living in
+        //     search_terms (e.g. a 1.5" coupling tagged '2" abs') can't inject a
+        //     false size. The item's REAL size lives in its name — anchor there.
+        const HAY_FULL = `(' ' || REPLACE(lower(name || ' ' || COALESCE(search_terms,'') || ' ' || COALESCE(emco_sku,'') || ' ' || COALESCE(code,'')), '"', ' ') || ' ')`;
+        const HAY_NAME = `(' ' || REPLACE(lower(name), '"', ' ') || ' ')`;
+        const isSize = (t) => /^\d+(?:[./]\d+)?$/.test(t);
+        const clauses = [];
+        const binds = [];
+        for (const t of tokens) {
+          if (isSize(t)) { clauses.push(`${HAY_NAME} LIKE ?`); binds.push(`% ${t} %`); }  // size: NAME only, space-anchored
+          else { clauses.push(`${HAY_FULL} LIKE ?`); binds.push(`%${t}%`); }              // word: full haystack (search_terms vocab)
+        }
+        // Relevance: exact name/sku (0) -> name prefix (1) -> name contains full q
+        // (2) -> token-only match (3). Then SHORTER names first (base fittings
+        // above long variants), then alphabetical — so best matches sit up top and
+        // broad terms aren't hidden alphabetically.
         const r = await env.DB.prepare(
           `SELECT id, code, emco_sku, name, cost, price, unit, category, search_terms,
                   conversion_factor, use_unit, purchase_unit, deduct_on_use, prompt_restock,
                   ROUND(COALESCE(cost_per_use_override, CASE WHEN conversion_factor>0 THEN cost/conversion_factor END),2) AS cost_per_use
              FROM crm_materials
-            WHERE is_active = 1
-              AND (name LIKE ? OR code LIKE ? OR emco_sku LIKE ? OR search_terms LIKE ?)
-            ORDER BY name
-            LIMIT 25`
-        ).bind(like, like, like, like).all();
+            WHERE is_active = 1 AND ${clauses.join(" AND ")}
+            ORDER BY
+              CASE
+                WHEN lower(name) = ? THEN 0
+                WHEN lower(emco_sku) = ? OR lower(code) = ? THEN 0
+                WHEN lower(name) LIKE ? THEN 1
+                WHEN lower(name) LIKE ? THEN 2
+                ELSE 3
+              END,
+              length(name), name
+            LIMIT 60`
+        ).bind(...binds, qlower, qlower, qlower, `${qlower}%`, `%${qlower}%`).all();
         return json(r.results || []);
       }
 

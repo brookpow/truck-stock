@@ -671,6 +671,10 @@ function Capture({ tech, job, onBack }) {
           <AddMaterialBtn m={m} saving={saving} add={add} />
         </div>
       ))}
+      {/* Zero-result hint so a genuine no-match never looks like a broken dropdown. */}
+      {q.trim().length >= 2 && results.length === 0 && (
+        <div style={styles.muted}>No matches — try fewer words (e.g. just "abs" or "2 abs").</div>
+      )}
 
       {categories.length > 0 && (
         <div style={styles.browseSection}>

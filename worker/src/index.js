@@ -662,6 +662,7 @@ export default {
         const purchases = (await env.DB.prepare(
           `SELECT pu.id, pu.created_at, pu.job_id, pu.job_number, pu.supplier,
                   pu.receipt_total AS cost, c.name AS customer,
+                  (pu.receipt_photo_url IS NOT NULL) AS has_photo,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name
@@ -674,11 +675,17 @@ export default {
             ORDER BY pu.id DESC LIMIT 500`
         ).bind(tid, from, to).all()).results || [];
 
+        // Each section is capped at 500 rows. `capped` flags when ANY section hit
+        // the cap so the UI can warn "showing first 500 — narrow the date range"
+        // — otherwise search would silently miss truncated jobs in a busy window.
+        const ROW_CAP = 500;
         return json({
           tech: tech || { st_tech_id: Number(tid), name: "#" + tid },
           van: van || null, from, to,
           usage, restocks, requests, purchases,
           totals: { usage: usage.length, restocks: restocks.length, requests: requests.length, receipts: purchases.length },
+          capped: usage.length >= ROW_CAP || purchases.length >= ROW_CAP || restocks.length >= ROW_CAP || requests.length >= ROW_CAP,
+          row_cap: ROW_CAP,
         });
       }
 
@@ -714,6 +721,7 @@ export default {
           `SELECT pu.id, pu.created_at, pu.tech_id AS st_tech_id, t.name AS tech_name,
                   pu.job_id, pu.job_number, pu.supplier, pu.receipt_total AS cost,
                   c.name AS customer,
+                  (pu.receipt_photo_url IS NOT NULL) AS has_photo,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name
@@ -1792,6 +1800,12 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
 
       // --- 4h. Serve a receipt photo from R2 (PRIVATE; through the worker) --
       // GET /api/purchases/:id/photo -> the stored JPEG, or 404 if none.
+      // AUTH TODO: this route is intentionally OPEN (an <img src> can't send a
+      // Bearer, and the office receipt views load it via <img>). It proxies a
+      // PRIVATE R2 object (never a raw storage URL). Receipts can contain card
+      // last-4s and supplier account numbers, so this MUST join the set of routes
+      // gated when real office auth lands — but hardening this one route before
+      // the rest of the worker is enforced is pointless. Gate it WITH the others.
       const photoMatch = p.match(/^\/api\/purchases\/(\d+)\/photo$/);
       if (photoMatch && request.method === "GET") {
         const row = await env.DB.prepare(

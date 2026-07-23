@@ -695,8 +695,19 @@ export default {
       // identical card. Each row carries its tech name (one chronological stream,
       // not per-tech sections). GET /api/activity/recent?days=3
       if (p === "/api/activity/recent" && request.method === "GET") {
-        const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "3", 10) || 3, 1), 31);
-        const since = (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - days); return d.toISOString().slice(0, 10); })();
+        // Two modes: a bare `days` window (the passive landing stream) OR an explicit
+        // from/to date range (the all-techs SEARCH — reaches back past the 3-day glance).
+        // Same 500-row/section cap + `capped` flag as the per-tech endpoint, so search
+        // never silently misses truncated jobs in a busy window.
+        const ROW_CAP = 500;
+        const qFrom = url.searchParams.get("from"), qTo = url.searchParams.get("to");
+        let from, to, days = null, since = null;
+        if (qFrom && qTo) { from = qFrom; to = qTo; }
+        else {
+          days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "3", 10) || 3, 1), 92);
+          since = (() => { const d = new Date(); d.setUTCDate(d.getUTCDate() - days); return d.toISOString().slice(0, 10); })();
+          from = since; to = new Date().toISOString().slice(0, 10);
+        }
         // jm-driven (see per-tech usage above): current qty from jm.quantity,
         // includes cost-only items, excludes deleted (gone) + receipt-matched
         // (tagged) lines. tech from jm.tech_id (= the logging tech).
@@ -714,9 +725,9 @@ export default {
              LEFT JOIN crm_materials mat ON mat.id = jm.material_id
              LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(jm.tech_id AS TEXT)
             WHERE (jm.notes IS NULL OR jm.notes NOT LIKE '${RECEIPT_TAG_PREFIX}%')
-              AND substr(jm.created_at,1,10) >= ?
-            ORDER BY jm.created_at DESC, jm.id DESC LIMIT 500`
-        ).bind(since).all()).results || [];
+              AND substr(jm.created_at,1,10) >= ? AND substr(jm.created_at,1,10) <= ?
+            ORDER BY jm.created_at DESC, jm.id DESC LIMIT ${ROW_CAP}`
+        ).bind(from, to).all()).results || [];
         const purchases = (await env.DB.prepare(
           `SELECT pu.id, pu.created_at, pu.tech_id AS st_tech_id, t.name AS tech_name,
                   pu.job_id, pu.job_number, pu.supplier, pu.receipt_total AS cost,
@@ -730,11 +741,12 @@ export default {
              LEFT JOIN crm_st_locations l ON l.id = j.location_id
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
              LEFT JOIN crm_techs t ON CAST(t.st_tech_id AS TEXT)=CAST(pu.tech_id AS TEXT)
-            WHERE pu.is_overhead = 0 AND substr(pu.created_at,1,10) >= ?
-            ORDER BY pu.id DESC LIMIT 500`
-        ).bind(since).all()).results || [];
-        return json({ since, days, usage, purchases,
-          totals: { usage: usage.length, purchases: purchases.length } });
+            WHERE pu.is_overhead = 0 AND substr(pu.created_at,1,10) >= ? AND substr(pu.created_at,1,10) <= ?
+            ORDER BY pu.id DESC LIMIT ${ROW_CAP}`
+        ).bind(from, to).all()).results || [];
+        return json({ since, days, from, to, usage, purchases,
+          totals: { usage: usage.length, purchases: purchases.length },
+          capped: usage.length >= ROW_CAP || purchases.length >= ROW_CAP, row_cap: ROW_CAP });
       }
 
       // --- 0b. Today's jobs for a tech (ServiceTitan-fed via D1) ----------

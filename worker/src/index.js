@@ -848,7 +848,7 @@ export default {
              LEFT JOIN (
                SELECT location_id, COUNT(*) AS below_par_count
                  FROM crm_inventory_stock
-                WHERE on_hand < min_qty
+                WHERE min_qty > 0 AND on_hand < min_qty   -- min_qty>0 guard matches the levels views exactly (a min_qty=0 row with negative on_hand must NOT count)
                 GROUP BY location_id
              ) c ON c.location_id = l.id
             WHERE l.type = 'truck' AND l.active = 1

@@ -1836,6 +1836,16 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
       if (p === "/api/jobs/search" && request.method === "GET") {
         const q = (url.searchParams.get("q") || "").trim();
         const dateExpr = "COALESCE(j.last_appointment_date, j.scheduled_date, j.modified_on, j.created_on)";
+        const day = `julianday(substr(${dateExpr},1,10))`;
+        // Distance-from-today ranking: today + just-completed at the top, future
+        // BELOW them — future distance is penalized 1.5x, so a job tomorrow still
+        // sits high but one scheduled in November never outranks yesterday's.
+        // Nulls (no date at all) sort last.
+        const order =
+          `ORDER BY (${dateExpr} IS NULL),
+                    (CASE WHEN ${day} <= julianday('now')
+                          THEN julianday('now') - ${day}
+                          ELSE (${day} - julianday('now')) * 1.5 END) ASC`;
         const base =
           `SELECT j.id AS job_id, j.job_number, j.status,
                   c.name AS customer,
@@ -1847,13 +1857,13 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
              LEFT JOIN crm_st_locations l ON l.id = j.location_id`;
         let jobs;
         if (q.length < 2) {
-          jobs = (await env.DB.prepare(`${base} ORDER BY ${dateExpr} DESC LIMIT 20`).all()).results || [];
+          jobs = (await env.DB.prepare(`${base} ${order} LIMIT 20`).all()).results || [];
         } else {
           const like = `%${q}%`;
           jobs = (await env.DB.prepare(
             `${base} WHERE j.job_number LIKE ?1 OR c.name LIKE ?1
                         OR l.address_street LIKE ?1 OR c.address_street LIKE ?1
-              ORDER BY ${dateExpr} DESC LIMIT 50`
+              ${order} LIMIT 50`
           ).bind(like).all()).results || [];
         }
         return json({ jobs });

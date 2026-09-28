@@ -1825,27 +1825,37 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
 
       // --- 4g. Office job lookup for receipt/invoice upload -------------------
       // GET /api/jobs/search?q=  -> jobs matching job#/customer/location (LIKE).
-      // The office receives invoices by email and attaches them to a job that may
-      // have no tech activity yet, so this searches crm_st_jobs directly (the
-      // office Activity "search" is only client-side filtering of a loaded window).
+      // EMPTY/absent q => RECENT mode: the ~20 most recently active jobs (ordered
+      // by most recent appointment date, so today's/upcoming jobs top the list) —
+      // the default list the office picks from before typing. Same response shape
+      // either way. The office receives invoices by email and attaches them to a
+      // job that may have no tech activity yet, so this searches crm_st_jobs
+      // directly (the office Activity "search" only filters an already-loaded window).
       // AUTH TODO: office route — open until real office auth (joins the same set
       // as /api/purchases/:id/photo and /api/jobs/:id/office-purchase).
       if (p === "/api/jobs/search" && request.method === "GET") {
         const q = (url.searchParams.get("q") || "").trim();
-        if (q.length < 2) return json({ jobs: [] });
-        const like = `%${q}%`;
-        const jobs = (await env.DB.prepare(
+        const dateExpr = "COALESCE(j.last_appointment_date, j.scheduled_date, j.modified_on, j.created_on)";
+        const base =
           `SELECT j.id AS job_id, j.job_number, j.status,
                   c.name AS customer,
                   COALESCE(l.address_street, c.address_street) AS address_street,
-                  COALESCE(l.address_city, c.address_city) AS address_city
+                  COALESCE(l.address_city, c.address_city) AS address_city,
+                  ${dateExpr} AS date
              FROM crm_st_jobs j
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
-             LEFT JOIN crm_st_locations l ON l.id = j.location_id
-            WHERE j.job_number LIKE ?1 OR c.name LIKE ?1
-               OR l.address_street LIKE ?1 OR c.address_street LIKE ?1
-            ORDER BY j.id DESC LIMIT 50`
-        ).bind(like).all()).results || [];
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id`;
+        let jobs;
+        if (q.length < 2) {
+          jobs = (await env.DB.prepare(`${base} ORDER BY ${dateExpr} DESC LIMIT 20`).all()).results || [];
+        } else {
+          const like = `%${q}%`;
+          jobs = (await env.DB.prepare(
+            `${base} WHERE j.job_number LIKE ?1 OR c.name LIKE ?1
+                        OR l.address_street LIKE ?1 OR c.address_street LIKE ?1
+              ORDER BY ${dateExpr} DESC LIMIT 50`
+          ).bind(like).all()).results || [];
+        }
         return json({ jobs });
       }
 

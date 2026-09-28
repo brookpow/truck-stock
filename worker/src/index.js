@@ -663,6 +663,7 @@ export default {
           `SELECT pu.id, pu.created_at, pu.job_id, pu.job_number, pu.supplier,
                   pu.receipt_total AS cost, c.name AS customer,
                   (pu.receipt_photo_url IS NOT NULL) AS has_photo,
+                  pu.source, pu.doc_only, pu.parent_purchase_id, pu.receipt_mime,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name
@@ -733,6 +734,7 @@ export default {
                   pu.job_id, pu.job_number, pu.supplier, pu.receipt_total AS cost,
                   c.name AS customer,
                   (pu.receipt_photo_url IS NOT NULL) AS has_photo,
+                  pu.source, pu.doc_only, pu.parent_purchase_id, pu.receipt_mime,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name
@@ -1647,7 +1649,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const purchases = (await env.DB.prepare(
           `SELECT id, supplier, subtotal, tax, receipt_total, description, created_at,
                   (receipt_photo_url IS NOT NULL) AS has_photo
-             FROM crm_job_purchases WHERE job_id = ? ORDER BY id DESC`
+             FROM crm_job_purchases
+            WHERE job_id = ? AND COALESCE(source,'tech') <> 'office'   -- tech app never shows office-uploaded receipts
+            ORDER BY id DESC`
         ).bind(jobId).all()).results || [];
         const mlines = (await env.DB.prepare(
           `SELECT jm.id AS line_id, jm.material_id, m.name AS material, m.emco_sku,
@@ -1778,6 +1782,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           `SELECT p.id, p.job_id, p.job_number, p.supplier, p.subtotal, p.tax,
                   p.receipt_total, p.description, p.tech_id, p.truck_location_id,
                   p.created_at, (p.receipt_photo_url IS NOT NULL) AS has_photo, p.is_overhead,
+                  p.source, p.doc_only, p.parent_purchase_id, p.receipt_mime,
                   t.name AS tech_name, j.status AS job_status,
                   c.name AS customer, c.address_street, c.address_city
              FROM crm_job_purchases p
@@ -1808,6 +1813,104 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           }
         }
         return json({ purchases: purchases.map((pp) => ({ ...pp, lines: byPurchase[pp.id] || [] })) });
+      }
+
+      // --- 4g. Office job lookup for receipt/invoice upload -------------------
+      // GET /api/jobs/search?q=  -> jobs matching job#/customer/location (LIKE).
+      // The office receives invoices by email and attaches them to a job that may
+      // have no tech activity yet, so this searches crm_st_jobs directly (the
+      // office Activity "search" is only client-side filtering of a loaded window).
+      // AUTH TODO: office route — open until real office auth (joins the same set
+      // as /api/purchases/:id/photo and /api/jobs/:id/office-purchase).
+      if (p === "/api/jobs/search" && request.method === "GET") {
+        const q = (url.searchParams.get("q") || "").trim();
+        if (q.length < 2) return json({ jobs: [] });
+        const like = `%${q}%`;
+        const jobs = (await env.DB.prepare(
+          `SELECT j.id AS job_id, j.job_number, j.status,
+                  c.name AS customer,
+                  COALESCE(l.address_street, c.address_street) AS address_street,
+                  COALESCE(l.address_city, c.address_city) AS address_city
+             FROM crm_st_jobs j
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
+            WHERE j.job_number LIKE ?1 OR c.name LIKE ?1
+               OR l.address_street LIKE ?1 OR c.address_street LIKE ?1
+            ORDER BY j.id DESC LIMIT 50`
+        ).bind(like).all()).results || [];
+        return json({ jobs });
+      }
+
+      // --- 4g-bis. Office receipt/invoice upload ------------------------------
+      // POST /api/jobs/:jobId/office-purchase  Body: {
+      //   supplier, total? (TAX-INCLUDED, matches mobile), subtotal?, tax?,
+      //   date? (YYYY-MM-DD, default now), note?, doc_only?,
+      //   files: [{ base64, media_type, filename? }]  (images and/or PDFs)
+      // }
+      // Writes crm_job_purchases exactly like the mobile scan flow so the cost
+      // feeds GP identically (buildGpJobs sums receipt_total by job_id) — but
+      // source='office', tech_id=0 (sentinel: no crm_techs row has st_tech_id=0,
+      // so office rows never surface in per-tech views), and NO crm_job_materials
+      // line logging (office doesn't itemize). Multi-file: the primary row carries
+      // the cost; extra files become doc_only sibling rows (parent_purchase_id) so
+      // a multi-page invoice reads as ONE purchase. doc_only => receipt_total 0.
+      // AUTH TODO: office write route — open until real office auth.
+      const officePurchMatch = p.match(/^\/api\/jobs\/([^/]+)\/office-purchase$/);
+      if (officePurchMatch && request.method === "POST") {
+        const jobId = officePurchMatch[1];
+        const b = await request.json().catch(() => ({}));
+        const supplier = (b.supplier || "").trim();
+        if (!supplier) return json({ error: "supplier required" }, 400);
+        const files = Array.isArray(b.files) ? b.files.filter((f) => f && f.base64) : [];
+        const docOnly = b.doc_only === true || b.doc_only === 1;
+        let total = 0;
+        if (!docOnly) {
+          total = Number(b.total);
+          if (!Number.isFinite(total)) return json({ error: "total must be a number (tax-included), or set doc_only" }, 400);
+        }
+        const subtotal = Number.isFinite(Number(b.subtotal)) ? Number(b.subtotal) : null;
+        const tax = Number.isFinite(Number(b.tax)) ? Number(b.tax) : null;
+        const note = (b.note && String(b.note).trim()) || null;
+        const createdAt = /^\d{4}-\d{2}-\d{2}$/.test(b.date || "") ? `${b.date} 12:00:00` : null; // null => DEFAULT now
+        const jobNumber = b.job_number ?? String(jobId);
+        const OFFICE_TECH = 0;
+
+        const extOf = (m) => m === "application/pdf" ? "pdf" : m === "image/png" ? "png" : m === "image/webp" ? "webp" : "jpg";
+        async function storeFile(pid, f) {
+          if (!env.RECEIPTS || !pid) return;
+          try {
+            const mime = f.media_type || "application/octet-stream";
+            const key = `receipts/${pid}.${extOf(mime)}`;
+            const bytes = Uint8Array.from(atob(f.base64), (c) => c.charCodeAt(0));
+            await env.RECEIPTS.put(key, bytes, { httpMetadata: { contentType: mime } });
+            await env.DB.prepare(`UPDATE crm_job_purchases SET receipt_photo_url=?, receipt_mime=? WHERE id=?`).bind(key, mime, pid).run();
+          } catch (_) { /* file is optional — never lose the row */ }
+        }
+
+        // Primary row (carries the cost, or is itself doc_only when no cost).
+        const ins = await env.DB.prepare(
+          `INSERT INTO crm_job_purchases
+             (job_id, job_number, supplier, receipt_total, subtotal, tax, description, tech_id, is_overhead, source, doc_only, created_at)
+           VALUES (?,?,?,?,?,?,?,?,0,'office',?, COALESCE(?, datetime('now')))`
+        ).bind(jobId, jobNumber, supplier, total, subtotal, tax, note, OFFICE_TECH, docOnly ? 1 : 0, createdAt).run();
+        const primaryId = ins.meta?.last_row_id ?? null;
+        if (files[0]) await storeFile(primaryId, files[0]);
+
+        // Extra files -> doc_only siblings grouped under the primary (one invoice,
+        // many pages/files = ONE purchase in the office views).
+        const siblingIds = [];
+        for (let i = 1; i < files.length; i++) {
+          const sIns = await env.DB.prepare(
+            `INSERT INTO crm_job_purchases
+               (job_id, job_number, supplier, receipt_total, subtotal, tax, description, tech_id, is_overhead, source, doc_only, parent_purchase_id, created_at)
+             VALUES (?,?,?,0,NULL,NULL,?,?,0,'office',1,?, COALESCE(?, datetime('now')))`
+          ).bind(jobId, jobNumber, supplier, note, OFFICE_TECH, primaryId, createdAt).run();
+          const sid = sIns.meta?.last_row_id ?? null;
+          if (sid) { await storeFile(sid, files[i]); siblingIds.push(sid); }
+        }
+
+        return json({ ok: true, job_id: jobId, purchase_id: primaryId, sibling_ids: siblingIds,
+          source: "office", doc_only: docOnly, receipt_total: total, files: files.length });
       }
 
       // --- 4h. Serve a receipt photo from R2 (PRIVATE; through the worker) --

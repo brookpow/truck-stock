@@ -1678,24 +1678,32 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const jobId = purchOne[1];
         const purchaseId = purchOne[2];
         const row = await env.DB.prepare(
-          `SELECT id, job_id FROM crm_job_purchases WHERE id = ?`
+          `SELECT id, job_id, receipt_photo_url FROM crm_job_purchases WHERE id = ?`
         ).bind(purchaseId).first();
         if (!row || String(row.job_id) !== String(jobId)) return json({ error: "not found" }, 404);
 
         if (request.method === "DELETE") {
+          // Office multi-file uploads attach doc_only siblings (parent_purchase_id);
+          // remove them WITH the primary so no row or R2 object is orphaned.
+          const siblings = (await env.DB.prepare(
+            `SELECT id, receipt_photo_url FROM crm_job_purchases WHERE parent_purchase_id = ?`
+          ).bind(purchaseId).all()).results || [];
           await env.DB.batch([
             env.DB.prepare(`DELETE FROM crm_job_materials WHERE job_id = ? AND notes = ?`)
               .bind(jobId, receiptTag(purchaseId)),
+            env.DB.prepare(`DELETE FROM crm_job_purchases WHERE parent_purchase_id = ?`).bind(purchaseId),
             env.DB.prepare(`DELETE FROM crm_job_purchases WHERE id = ?`).bind(purchaseId),
           ]);
-          // Drop the receipt photo from R2 too (non-fatal). Report the outcome
-          // so a storage failure is visible, not silently swallowed.
+          // Drop each stored R2 object by its ACTUAL key (jpg/png/pdf), non-fatal.
+          // Report the outcome so a storage failure is visible, not swallowed.
           let photo_removed = false, photo_error = null;
           if (env.RECEIPTS) {
-            try { await env.RECEIPTS.delete(`receipts/${purchaseId}.jpg`); photo_removed = true; }
+            const keys = [row.receipt_photo_url, ...siblings.map((s) => s.receipt_photo_url)].filter(Boolean);
+            if (keys.length === 0) keys.push(`receipts/${purchaseId}.jpg`);   // legacy rows w/ no stored key
+            try { await Promise.all(keys.map((k) => env.RECEIPTS.delete(k))); photo_removed = true; }
             catch (e) { photo_error = String(e?.message || e); }
           }
-          return json({ ok: true, deleted_purchase: Number(purchaseId), photo_removed, photo_error, deducted_van_stock: false });
+          return json({ ok: true, deleted_purchase: Number(purchaseId), deleted_siblings: siblings.map((s) => s.id), photo_removed, photo_error, deducted_van_stock: false });
         }
 
         // PATCH — header only (matched lines are edited as ordinary materials).

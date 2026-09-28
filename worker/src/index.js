@@ -1841,11 +1841,14 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         // BELOW them — future distance is penalized 1.5x, so a job tomorrow still
         // sits high but one scheduled in November never outranks yesterday's.
         // Nulls (no date at all) sort last.
+        // Compare at day granularity (start of day), else the current time-of-day
+        // makes tomorrow-midnight appear "closer" than today-midnight.
+        const today0 = "julianday('now','start of day')";
         const order =
           `ORDER BY (${dateExpr} IS NULL),
-                    (CASE WHEN ${day} <= julianday('now')
-                          THEN julianday('now') - ${day}
-                          ELSE (${day} - julianday('now')) * 1.5 END) ASC`;
+                    (CASE WHEN ${day} <= ${today0}
+                          THEN ${today0} - ${day}
+                          ELSE (${day} - ${today0}) * 1.5 END) ASC`;
         const base =
           `SELECT j.id AS job_id, j.job_number, j.status,
                   c.name AS customer,

@@ -1714,7 +1714,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const jobId = purchOne[1];
         const purchaseId = purchOne[2];
         const row = await env.DB.prepare(
-          `SELECT id, job_id, receipt_photo_url FROM crm_job_purchases WHERE id = ?`
+          `SELECT id, job_id, receipt_photo_url, is_return FROM crm_job_purchases WHERE id = ?`
         ).bind(purchaseId).first();
         if (!row || String(row.job_id) !== String(jobId)) return json({ error: "not found" }, 404);
 
@@ -1746,9 +1746,19 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const b = await request.json().catch(() => ({}));
         const sets = [], binds = [];
         if (b.supplier != null && String(b.supplier).trim()) { sets.push("supplier = ?"); binds.push(String(b.supplier).trim()); }
-        if (b.subtotal != null && Number.isFinite(Number(b.subtotal))) { sets.push("subtotal = ?"); binds.push(Number(b.subtotal)); }
-        if (b.tax != null && Number.isFinite(Number(b.tax))) { sets.push("tax = ?"); binds.push(Number(b.tax)); }
-        if (b.total != null && Number.isFinite(Number(b.total))) { sets.push("receipt_total = ?"); binds.push(Number(b.total)); }
+        if (row.is_return === 1) {
+          // CREDIT sign guard: a credit's amount can be edited but is ALWAYS stored
+          // negative, whatever the client sends; subtotal/tax are ignored (a
+          // positive-receipt edit form would otherwise recompute a positive total
+          // and silently flip the credit into a charge).
+          if (b.total != null && Number.isFinite(Number(b.total)) && Number(b.total) !== 0) {
+            sets.push("receipt_total = ?"); binds.push(-(Math.round(Math.abs(Number(b.total)) * 100) / 100));
+          }
+        } else {
+          if (b.subtotal != null && Number.isFinite(Number(b.subtotal))) { sets.push("subtotal = ?"); binds.push(Number(b.subtotal)); }
+          if (b.tax != null && Number.isFinite(Number(b.tax))) { sets.push("tax = ?"); binds.push(Number(b.tax)); }
+          if (b.total != null && Number.isFinite(Number(b.total))) { sets.push("receipt_total = ?"); binds.push(Number(b.total)); }
+        }
         if (!sets.length) return json({ error: "nothing to update" }, 400);
         await env.DB.prepare(`UPDATE crm_job_purchases SET ${sets.join(", ")} WHERE id = ?`).bind(...binds, purchaseId).run();
         const updated = await env.DB.prepare(

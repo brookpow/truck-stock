@@ -2007,7 +2007,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           const origId = Number(ln.material_line_id), qty = Number(ln.qty);
           if (!Number.isFinite(origId) || !Number.isFinite(qty) || qty <= 0) return json({ error: "each line needs material_line_id + positive qty" }, 400);
           const orig = await env.DB.prepare(
-            `SELECT id, job_id, material_id, quantity, unit_cost, job_number, notes FROM crm_job_materials WHERE id=?`
+            `SELECT id, job_id, material_id, quantity, unit_cost, job_number, notes, truck_location_id FROM crm_job_materials WHERE id=?`
           ).bind(origId).first();
           if (!orig || String(orig.job_id) !== String(jobId)) return json({ error: `line ${origId} not on job ${jobId}` }, 404);
           if (orig.quantity <= 0) return json({ error: `line ${origId} is not a positive usage line` }, 400);
@@ -2058,6 +2058,16 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
               `INSERT INTO crm_inventory_stock (location_id, material_id, on_hand) VALUES (1, ?, ?)
                ON CONFLICT(location_id, material_id) DO UPDATE SET on_hand = on_hand + excluded.on_hand, modified_at=datetime('now')`
             ).bind(v.orig.material_id, v.qty).run();
+          } else {
+            // SUPPLIER: the unit left the fleet at the ORIGINAL job_usage (no double-
+            // deduct here), so this is a 0-qty AUDIT row that records the disposition —
+            // the ledger keeps the complete fleet story (where the unit went), tagged
+            // to this return batch. No stock change, no purchase row.
+            await env.DB.prepare(
+              `INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, batch_id, created_by, actor_id, created_at)
+               VALUES (?,?,0,?,?,?,?,?,?, datetime('now'))`
+            ).bind(v.orig.material_id, v.orig.truck_location_id ?? 1, "manual", negLineId,
+                   `returned to supplier ${supplier || "(unspecified)"}, job #${jobId}`, batchId, b.tech_id ?? null, b.tech_id ?? null).run();
           }
           out.push({ material_id: v.orig.material_id, qty: v.qty, unit_cost: uc, cost_reversed: lineTotal, return_line_id: negLineId });
         }

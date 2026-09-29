@@ -663,7 +663,7 @@ export default {
           `SELECT pu.id, pu.created_at, pu.job_id, pu.job_number, pu.supplier,
                   pu.receipt_total AS cost, c.name AS customer,
                   (pu.receipt_photo_url IS NOT NULL) AS has_photo,
-                  pu.source, pu.doc_only, pu.parent_purchase_id, pu.receipt_mime,
+                  pu.source, pu.doc_only, pu.parent_purchase_id, pu.receipt_mime, pu.is_return,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name
@@ -734,7 +734,7 @@ export default {
                   pu.job_id, pu.job_number, pu.supplier, pu.receipt_total AS cost,
                   c.name AS customer,
                   (pu.receipt_photo_url IS NOT NULL) AS has_photo,
-                  pu.source, pu.doc_only, pu.parent_purchase_id, pu.receipt_mime,
+                  pu.source, pu.doc_only, pu.parent_purchase_id, pu.receipt_mime, pu.is_return,
                   COALESCE(l.address_street, c.address_street) AS address_street,
                   COALESCE(l.address_city, c.address_city) AS address_city,
                   l.name AS location_name
@@ -1648,7 +1648,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         const jobId = purchMatch[1];
         const purchases = (await env.DB.prepare(
           `SELECT id, supplier, subtotal, tax, receipt_total, description, created_at,
-                  (receipt_photo_url IS NOT NULL) AS has_photo
+                  (receipt_photo_url IS NOT NULL) AS has_photo, is_return, receipt_mime
              FROM crm_job_purchases
             WHERE job_id = ? AND COALESCE(source,'tech') <> 'office'   -- tech app never shows office-uploaded receipts
             ORDER BY id DESC`
@@ -1790,7 +1790,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           `SELECT p.id, p.job_id, p.job_number, p.supplier, p.subtotal, p.tax,
                   p.receipt_total, p.description, p.tech_id, p.truck_location_id,
                   p.created_at, (p.receipt_photo_url IS NOT NULL) AS has_photo, p.is_overhead,
-                  p.source, p.doc_only, p.parent_purchase_id, p.receipt_mime,
+                  p.source, p.doc_only, p.parent_purchase_id, p.receipt_mime, p.is_return,
                   t.name AS tech_name, j.status AS job_status,
                   c.name AS customer, c.address_street, c.address_city
              FROM crm_job_purchases p
@@ -1942,6 +1942,140 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
 
         return json({ ok: true, job_id: jobId, purchase_id: primaryId, sibling_ids: siblingIds,
           source: "office", doc_only: docOnly, receipt_total: total, files: files.length });
+      }
+
+      // --- 4h-i. Returns · Branch A: supplier/box-store CREDIT slip against a job.
+      // ONE negative crm_job_purchases row (is_return=1, receipt_total<0) so the
+      // job's receipt cost drops by exactly the credit → GP rises by the credit.
+      // Photo (the credit slip) stored + served via /api/purchases/:id/photo.
+      // NOT for truck stock physically returned to a supplier — that reverses the
+      // JOB via /returns/stock; a credit here offsets money the supplier gave back
+      // against THIS job's cost. (The tech UI states this.)
+      const retCreditMatch = p.match(/^\/api\/jobs\/([^/]+)\/returns\/credit$/);
+      if (retCreditMatch && request.method === "POST") {
+        const jobId = retCreditMatch[1];
+        const b = await request.json().catch(() => ({}));
+        if (techTok) b.tech_id = techTok.payload.tech_id;
+        const supplier = (b.supplier || "").trim();
+        const amount = Number(b.amount);
+        if (!supplier) return json({ error: "supplier required" }, 400);
+        if (!Number.isFinite(amount) || amount <= 0) return json({ error: "amount must be a positive number (the credit value)" }, 400);
+        const credit = -(Math.round(Math.abs(amount) * 100) / 100);   // stored NEGATIVE
+        const ins = await env.DB.prepare(
+          `INSERT INTO crm_job_purchases
+             (job_id, job_number, supplier, receipt_total, description, tech_id, is_overhead, source, doc_only, is_return, created_at)
+           VALUES (?,?,?,?,?,?,0,'tech',0,1, datetime('now'))`
+        ).bind(jobId, b.job_number ?? String(jobId), supplier, credit, b.description ?? "supplier credit", b.tech_id ?? null).run();
+        const pid = ins.meta?.last_row_id ?? null;
+        if (pid && b.image_base64 && env.RECEIPTS) {
+          try {
+            const mime = b.media_type || "image/jpeg";
+            const ext = mime === "application/pdf" ? "pdf" : mime === "image/png" ? "png" : "jpg";
+            const key = `receipts/${pid}.${ext}`;
+            await env.RECEIPTS.put(key, Uint8Array.from(atob(b.image_base64), (c) => c.charCodeAt(0)), { httpMetadata: { contentType: mime } });
+            await env.DB.prepare(`UPDATE crm_job_purchases SET receipt_photo_url=?, receipt_mime=? WHERE id=?`).bind(key, mime, pid).run();
+          } catch (_) { /* photo optional */ }
+        }
+        return json({ ok: true, job_id: jobId, purchase_id: pid, is_return: true, receipt_total: credit });
+      }
+
+      // --- 4h-ii. Returns · Branch B: truck stock returned FROM a job.
+      // Per line: a NEGATIVE crm_job_materials row at the ORIGINAL line's FROZEN
+      // unit_cost (job cost drops by exactly qty × that cost, not current catalog).
+      // Destination:
+      //   'shop'     -> +qty back into shop stock (loc 1) via a 'manual' movement.
+      //   'supplier' -> leaves the fleet (already off-van at the original job_usage),
+      //                 so NO stock movement and NO purchase row — the supplier credit
+      //                 offsets the PO, not the job (the material line already reversed
+      //                 the job). The credit slip is captured as the batch photo only.
+      // Originals are never edited; each return is its own timestamped event. All-or-
+      // nothing validation (returnable remaining = original qty − already-returned).
+      const retStockMatch = p.match(/^\/api\/jobs\/([^/]+)\/returns\/stock$/);
+      if (retStockMatch && request.method === "POST") {
+        const jobId = retStockMatch[1];
+        const b = await request.json().catch(() => ({}));
+        if (techTok) b.tech_id = techTok.payload.tech_id;
+        const destination = b.destination === "supplier" ? "supplier" : b.destination === "shop" ? "shop" : null;
+        if (!destination) return json({ error: "destination must be 'shop' or 'supplier'" }, 400);
+        const supplier = (b.supplier || "").trim() || null;
+        const lines = Array.isArray(b.lines) ? b.lines : [];
+        if (!lines.length) return json({ error: "no lines to return" }, 400);
+        const r2 = (x) => Math.round(x * 100) / 100;
+
+        const validated = [];
+        for (const ln of lines) {
+          const origId = Number(ln.material_line_id), qty = Number(ln.qty);
+          if (!Number.isFinite(origId) || !Number.isFinite(qty) || qty <= 0) return json({ error: "each line needs material_line_id + positive qty" }, 400);
+          const orig = await env.DB.prepare(
+            `SELECT id, job_id, material_id, quantity, unit_cost, job_number, notes FROM crm_job_materials WHERE id=?`
+          ).bind(origId).first();
+          if (!orig || String(orig.job_id) !== String(jobId)) return json({ error: `line ${origId} not on job ${jobId}` }, 404);
+          if (orig.quantity <= 0) return json({ error: `line ${origId} is not a positive usage line` }, 400);
+          if (orig.notes && (orig.notes.startsWith("return of line #") || orig.notes.startsWith("receipt purchase #")))
+            return json({ error: `line ${origId} is a return/receipt-matched line, not returnable` }, 400);
+          const prev = await env.DB.prepare(
+            `SELECT COALESCE(SUM(quantity),0) AS returned FROM crm_job_materials WHERE job_id=? AND notes LIKE ?`
+          ).bind(jobId, `return of line #${origId}%`).first();
+          const remaining = r2(orig.quantity + (prev?.returned || 0));   // prev.returned is ≤ 0
+          if (qty > remaining + 1e-9) return json({ error: `line ${origId}: returning ${qty} exceeds remaining ${remaining}` }, 409);
+          validated.push({ orig, qty });
+        }
+
+        const hdr = await env.DB.prepare(
+          `INSERT INTO crm_inventory_returns (job_id, job_number, tech_id, destination, supplier, notes, created_at)
+           VALUES (?,?,?,?,?,?, datetime('now'))`
+        ).bind(jobId, b.job_number ?? String(jobId), b.tech_id ?? null, destination, supplier, b.note ?? null).run();
+        const returnId = hdr.meta?.last_row_id ?? null;
+        if (returnId && b.image_base64 && env.RECEIPTS) {
+          try {
+            const mime = b.media_type || "image/jpeg";
+            const ext = mime === "application/pdf" ? "pdf" : mime === "image/png" ? "png" : "jpg";
+            const key = `returns/${returnId}.${ext}`;
+            await env.RECEIPTS.put(key, Uint8Array.from(atob(b.image_base64), (c) => c.charCodeAt(0)), { httpMetadata: { contentType: mime } });
+            await env.DB.prepare(`UPDATE crm_inventory_returns SET photo_key=?, photo_mime=? WHERE id=?`).bind(key, mime, returnId).run();
+          } catch (_) { /* photo optional */ }
+        }
+        const batchId = `return:${returnId}`;
+        const out = [];
+        for (const v of validated) {
+          const uc = v.orig.unit_cost || 0;
+          const lineTotal = -(Math.round(v.qty * uc * 100) / 100);
+          const negIns = await env.DB.prepare(
+            `INSERT INTO crm_job_materials
+               (job_id, job_number, material_id, quantity, unit_cost, total_cost, tech_id, notes, is_prepull, created_at)
+             VALUES (?,?,?,?,?,?,?,?,0, datetime('now'))`
+          ).bind(jobId, v.orig.job_number ?? String(jobId), v.orig.material_id, -v.qty, uc, lineTotal, b.tech_id ?? null,
+                 `return of line #${v.orig.id} [batch ${returnId}] -> ${destination}`).run();
+          const negLineId = negIns.meta?.last_row_id ?? null;
+          if (destination === "shop") {
+            // Physically re-enters SHOP stock (loc 1). It left the van at the original
+            // job_usage, so the van is NOT touched here.
+            await env.DB.prepare(
+              `INSERT INTO crm_inventory_movements (material_id, location_id, qty_change, reason, reference_id, notes, batch_id, created_by, actor_id, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?, datetime('now'))`
+            ).bind(v.orig.material_id, 1, v.qty, "manual", negLineId, `return from job #${jobId} to shop`, batchId, b.tech_id ?? null, b.tech_id ?? null).run();
+            await env.DB.prepare(
+              `INSERT INTO crm_inventory_stock (location_id, material_id, on_hand) VALUES (1, ?, ?)
+               ON CONFLICT(location_id, material_id) DO UPDATE SET on_hand = on_hand + excluded.on_hand, modified_at=datetime('now')`
+            ).bind(v.orig.material_id, v.qty).run();
+          }
+          out.push({ material_id: v.orig.material_id, qty: v.qty, unit_cost: uc, cost_reversed: lineTotal, return_line_id: negLineId });
+        }
+        return json({ ok: true, job_id: jobId, return_id: returnId, destination, supplier, lines: out,
+          note: destination === "supplier"
+            ? "cost reversed on job; item left the fleet at original usage; no purchase row (a supplier credit offsets the PO, not the job)"
+            : "cost reversed on job; qty returned to shop stock" });
+      }
+
+      // --- 4h-iii. Serve a stock-return batch photo (credit slip) from R2. ------
+      const retPhotoMatch = p.match(/^\/api\/returns\/(\d+)\/photo$/);
+      if (retPhotoMatch && request.method === "GET") {
+        const row = await env.DB.prepare(`SELECT photo_key, photo_mime FROM crm_inventory_returns WHERE id = ?`).bind(retPhotoMatch[1]).first();
+        if (!row || !row.photo_key) return json({ error: "no_photo" }, 404);
+        if (!env.RECEIPTS) return json({ error: "storage_unbound" }, 503);
+        const obj = await env.RECEIPTS.get(row.photo_key);
+        if (!obj) return json({ error: "not_in_storage" }, 404);
+        return new Response(obj.body, { headers: { "content-type": obj.httpMetadata?.contentType || row.photo_mime || "image/jpeg", "cache-control": "private, max-age=86400", "access-control-allow-origin": "*" } });
       }
 
       // --- 4h. Serve a receipt photo from R2 (PRIVATE; through the worker) --

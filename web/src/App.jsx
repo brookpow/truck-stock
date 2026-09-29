@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
   scanReceipt, savePurchase, saveOverheadPurchase, restockFromShop, getJobPurchases, deletePurchase, patchPurchase,
   getByCategory, createRequest, receiptPhotoUrl, createRestockRequest, getRestockRequests, dismissRestockRequest,
-  returnCredit, returnStock,
+  returnCredit, returnStock, getRecentJobs,
   startCount, getCurrentCount, saveCountItems, finishCount, discardCount,
   techList, techLogin, getTechToken, setTechToken, setOnAuthLost } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
@@ -179,6 +179,7 @@ function Jobs({ tech, onSignOut }) {
   const [active, setActive] = useState(null); // selected job
   const [scanOpen, setScanOpen] = useState(false); // home-screen receipt scan (destination chosen after scan)
   const [fromShop, setFromShop] = useState(false); // restock from shop (shop→van transfer)
+  const [returnPick, setReturnPick] = useState(false); // returns: pick a recent job first
   const [err, setErr] = useState(false);
   const [refreshing, setRefreshing] = useState(false); // manual ↻ in-flight
   const [countView, setCountView] = useState(null);  // { start:{scope,categories} } | { resume: countObj }
@@ -237,6 +238,9 @@ function Jobs({ tech, onSignOut }) {
   }
   if (fromShop) {
     return <FromShopRestock tech={tech} onBack={() => setFromShop(false)} />;
+  }
+  if (returnPick) {
+    return <ReturnStart tech={tech} onBack={() => setReturnPick(false)} />;
   }
   if (spotPicker) {
     return <SpotCheckPicker onCancel={() => setSpotPicker(false)}
@@ -368,6 +372,15 @@ function Jobs({ tech, onSignOut }) {
         <span style={styles.actText}>
           <span style={styles.actTitle}>Restocked from shop</span>
           <span style={styles.actDesc}>Pulled stock to my van</span>
+        </span>
+      </button>
+      <button style={styles.actRow} className="fm-press" onClick={() => setReturnPick(true)}>
+        <span style={{ ...styles.actIco, color: C.redInk, background: C.redWash }}>
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 14L4 9l5-5" /><path d="M4 9h11a5 5 0 0 1 5 5v1" /></svg>
+        </span>
+        <span style={styles.actText}>
+          <span style={styles.actTitle}>↩ Return items</span>
+          <span style={styles.actDesc}>Supplier credit or truck stock — pick any recent job</span>
         </span>
       </button>
 
@@ -922,6 +935,69 @@ function fileToScaledBase64(file, maxDim = 1600, quality = 0.92) {
     };
     reader.readAsDataURL(file);
   });
+}
+
+// ---- Returns entry from Today's Jobs: pick a job (this tech's recent jobs,
+// last 60 days, newest first, + search) then hand off to the branch chooser.
+// Returns usually happen days/weeks after the job, so this reaches past today.
+function ReturnStart({ tech, onBack }) {
+  const [jobs, setJobs] = useState(null);   // recent jobs (null = loading)
+  const [q, setQ] = useState("");
+  const [job, setJob] = useState(null);     // picked { id, num, cust }
+  const [items, setItems] = useState(null); // picked job's logged lines (null = not loaded)
+  const [err, setErr] = useState(null);
+  const [loadingJob, setLoadingJob] = useState(false);
+
+  useEffect(() => {
+    getRecentJobs(tech.st_tech_id, 60)
+      .then((r) => setJobs(r.jobs || []))
+      .catch((e) => { setErr(String(e.message || e)); setJobs([]); });
+  }, [tech]);
+
+  async function pick(r) {
+    setErr(null); setLoadingJob(true);
+    const j = { id: r.job_id, num: r.job_number, cust: r.customer };
+    try {
+      const m = await getJobMaterials(r.job_id);
+      setItems(m.items || []);
+    } catch {
+      setItems([]);   // still allow the credit branch even if materials don't load
+    } finally { setJob(j); setLoadingJob(false); }
+  }
+
+  // Job picked + its lines loaded → the existing branch chooser (unchanged).
+  if (job && items != null) {
+    return <ReturnsFlow tech={tech} job={job} items={items}
+      onCancel={() => { setJob(null); setItems(null); }}
+      onDone={() => onBack()} />;
+  }
+
+  const ql = q.trim().toLowerCase();
+  const shown = ql
+    ? (jobs || []).filter((r) => `${r.job_number} ${r.customer || ""} ${r.address || ""}`.toLowerCase().includes(ql))
+    : (jobs || []);
+
+  return (
+    <div style={styles.screen}>
+      <div style={styles.topbar}>
+        <button style={styles.linkBtn} onClick={onBack}>← jobs</button>
+        <span style={styles.who}>Return items</span>
+      </div>
+      <h1 style={styles.h1}>Pick the job</h1>
+      <p style={styles.sub}>Your recent jobs (last 60 days), newest first. Returns often come days or weeks after the job.</p>
+      <input style={styles.input} value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search job #, customer, or address…" autoFocus />
+      {err && <div style={styles.error}>{err}</div>}
+      {loadingJob && <div style={styles.muted}>Opening job…</div>}
+      {jobs === null && <div style={styles.muted}>Loading your recent jobs…</div>}
+      {jobs && shown.length === 0 && <div style={styles.muted}>{ql ? "No recent jobs match." : "No recent jobs in the last 60 days."}</div>}
+      {shown.map((r) => (
+        <button key={r.job_id} style={styles.jobPickRow} className="fm-press" onClick={() => pick(r)} disabled={loadingJob}>
+          <span style={styles.jobPickTitle}>{r.customer || `job #${r.job_number}`}</span>
+          <span style={styles.muted}>#{r.job_number}{r.address ? ` · ${r.address}` : ""} · {String(r.start_date || "").slice(0, 10)} · {r.status}</span>
+        </button>
+      ))}
+    </div>
+  );
 }
 
 // ---- Returns: supplier credit slip (Branch A) OR truck stock (Branch B) ------
@@ -1653,6 +1729,8 @@ const styles = {
   scanBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
   returnBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.redInk, border: `1px solid ${C.red}`, background: C.redWash, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
   guardNote: { fontSize: 13, color: C.amberInk, background: C.amberWash, border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 12px", margin: "6px 0 12px" },
+  jobPickRow: { ...card, display: "flex", flexDirection: "column", gap: 3, width: "100%", boxSizing: "border-box", textAlign: "left", cursor: "pointer", padding: "13px 15px", borderRadius: 14, border: `1px solid ${C.hair}`, marginBottom: 9 },
+  jobPickTitle: { fontWeight: 700, fontSize: 15, color: C.ink },
   fieldLbl: { display: "block", fontSize: 13, fontWeight: 700, color: C.ink2, margin: "6px 0 4px" },
   retRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.hair}` },
   retName: { fontSize: 14, color: C.ink, minWidth: 0 },

@@ -223,6 +223,14 @@ export async function patchPurchase(jobId, id, body) {
   return d;
 }
 
+// A tech's RECENT jobs (default 60 days, newest first, incl. completed) for the
+// returns job picker. -> { jobs:[{ job_id, job_number, customer, address, status, start_date }] }
+export async function getRecentJobs(stTechId, days = 60) {
+  const r = await fetch(`${API}/api/techs/recent-jobs?st_tech_id=${encodeURIComponent(stTechId)}&days=${days}`);
+  if (!r.ok) throw new Error("recent-jobs " + r.status);
+  return r.json();
+}
+
 // Returns · Branch A: a supplier/box-store CREDIT slip against a job (negative
 // purchase). body: { supplier, amount (positive), image_base64?, media_type? }.
 export async function returnCredit(jobId, body) {

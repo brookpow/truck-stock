@@ -856,6 +856,9 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
   const tax = r2((Number(total) || 0) - (Number(subtotal) || 0));
   function onSubtotal(v) { setSubtotal(v); setTotal(String(r2((Number(v) || 0) * (1 + TAX_RATE)))); }
   const lines = purchase.lines || [];
+  const isReturn = purchase.is_return === 1 || purchase.is_return === true;
+  // Credits edit AMOUNT ONLY, entered positive; the worker always stores it negative.
+  const [creditAmt, setCreditAmt] = useState(String(Math.abs(Number(purchase.receipt_total) || 0)));
 
   async function del() {
     if (!confirm(`Delete this receipt (${purchase.supplier} · ${fmt(purchase.receipt_total)})?\nRemoves it and any matched lines it logged. No van stock changes.`)) return;
@@ -864,9 +867,13 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
     catch (e) { alert("Delete failed: " + (e.message || e)); setBusy(false); }
   }
   async function saveEdit() {
+    if (isReturn && !(Number(creditAmt) > 0)) { alert("Enter the credit amount (a positive number)."); return; }
     setBusy(true);
     try {
-      await patchPurchase(jobId, purchase.id, { supplier: supplier.trim(), subtotal: Number(subtotal) || 0, tax, total: Number(total) || 0 });
+      const body = isReturn
+        ? { supplier: supplier.trim(), total: Number(creditAmt) }   // no subtotal/tax on a credit
+        : { supplier: supplier.trim(), subtotal: Number(subtotal) || 0, tax, total: Number(total) || 0 };
+      await patchPurchase(jobId, purchase.id, body);
       setEditing(false); onChanged();
     } catch (e) { alert("Edit failed: " + (e.message || e)); setBusy(false); }
   }
@@ -903,9 +910,13 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
         <div style={styles.receiptBody}>
           <div style={styles.muted}>Supplier</div>
           <input style={styles.input} value={supplier} onChange={(e) => setSupplier(e.target.value)} />
-          <div style={styles.taxRow}><span style={styles.muted}>Subtotal</span><input style={styles.taxInput} inputMode="decimal" value={subtotal} onChange={(e) => onSubtotal(e.target.value)} /></div>
-          <div style={styles.taxRow}><span style={styles.muted}>Tax (12%)</span><span style={styles.taxVal}>{fmt(tax)}</span></div>
-          <div style={styles.taxRow}><span style={{ fontWeight: 700 }}>Total</span><input style={{ ...styles.taxInput, fontWeight: 700 }} inputMode="decimal" value={total} onChange={(e) => setTotal(e.target.value)} /></div>
+          {isReturn ? (
+            <div style={styles.taxRow}><span style={{ fontWeight: 700 }}>Credit amount (saved as −)</span><input style={{ ...styles.taxInput, fontWeight: 700 }} inputMode="decimal" value={creditAmt} onChange={(e) => setCreditAmt(e.target.value)} /></div>
+          ) : (<>
+            <div style={styles.taxRow}><span style={styles.muted}>Subtotal</span><input style={styles.taxInput} inputMode="decimal" value={subtotal} onChange={(e) => onSubtotal(e.target.value)} /></div>
+            <div style={styles.taxRow}><span style={styles.muted}>Tax (12%)</span><span style={styles.taxVal}>{fmt(tax)}</span></div>
+            <div style={styles.taxRow}><span style={{ fontWeight: 700 }}>Total</span><input style={{ ...styles.taxInput, fontWeight: 700 }} inputMode="decimal" value={total} onChange={(e) => setTotal(e.target.value)} /></div>
+          </>)}
           <button style={styles.primary} disabled={busy} onClick={saveEdit}>{busy ? "Saving…" : "Save changes"}</button>
         </div>
       )}

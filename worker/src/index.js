@@ -1930,8 +1930,14 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         if (!supplier) return json({ error: "supplier required" }, 400);
         const files = Array.isArray(b.files) ? b.files.filter((f) => f && f.base64) : [];
         const docOnly = b.doc_only === true || b.doc_only === 1;
-        let total = 0;
-        if (!docOnly) {
+        const isReturn = b.is_return === true || b.is_return === 1;   // office credit/return memo
+        let total = 0, isRet = 0;
+        if (isReturn) {
+          const amt = Number(b.total);
+          if (!Number.isFinite(amt) || amt <= 0) return json({ error: "credit amount must be a positive number" }, 400);
+          total = -(Math.round(Math.abs(amt) * 100) / 100);   // stored NEGATIVE — drops job cost by exactly the credit
+          isRet = 1;
+        } else if (!docOnly) {
           total = Number(b.total);
           if (!Number.isFinite(total)) return json({ error: "total must be a number (tax-included), or set doc_only" }, 400);
         }
@@ -1957,9 +1963,9 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         // Primary row (carries the cost, or is itself doc_only when no cost).
         const ins = await env.DB.prepare(
           `INSERT INTO crm_job_purchases
-             (job_id, job_number, supplier, receipt_total, subtotal, tax, description, tech_id, is_overhead, source, doc_only, created_at)
-           VALUES (?,?,?,?,?,?,?,?,0,'office',?, COALESCE(?, datetime('now')))`
-        ).bind(jobId, jobNumber, supplier, total, subtotal, tax, note, OFFICE_TECH, docOnly ? 1 : 0, createdAt).run();
+             (job_id, job_number, supplier, receipt_total, subtotal, tax, description, tech_id, is_overhead, source, doc_only, is_return, created_at)
+           VALUES (?,?,?,?,?,?,?,?,0,'office',?,?, COALESCE(?, datetime('now')))`
+        ).bind(jobId, jobNumber, supplier, total, subtotal, tax, note, OFFICE_TECH, isReturn ? 0 : (docOnly ? 1 : 0), isRet, createdAt).run();
         const primaryId = ins.meta?.last_row_id ?? null;
         if (files[0]) await storeFile(primaryId, files[0]);
 
@@ -1977,7 +1983,45 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
         }
 
         return json({ ok: true, job_id: jobId, purchase_id: primaryId, sibling_ids: siblingIds,
-          source: "office", doc_only: docOnly, receipt_total: total, files: files.length });
+          source: "office", doc_only: docOnly, is_return: isReturn, receipt_total: total, files: files.length });
+      }
+
+      // --- 4g-ter. A job's existing returns/credits — the office double-count guard.
+      // An emailed EMCO credit memo often matches a counter return a tech already
+      // recorded days earlier; surface those (date/amount/items/who) so the office
+      // can attach the memo document-only instead of crediting the job twice.
+      const jobReturnsMatch = p.match(/^\/api\/jobs\/([^/]+)\/returns$/);
+      if (jobReturnsMatch && request.method === "GET") {
+        const jobId = jobReturnsMatch[1];
+        const credits = (await env.DB.prepare(
+          `SELECT p.id, p.supplier, p.receipt_total AS amount, p.created_at, p.source,
+                  COALESCE(t.name, CASE WHEN p.source='office' THEN 'Office' ELSE 'tech ' || p.tech_id END) AS who
+             FROM crm_job_purchases p
+             LEFT JOIN crm_techs t ON t.st_tech_id = p.tech_id
+            WHERE p.job_id = ? AND p.is_return = 1
+            ORDER BY p.id DESC`
+        ).bind(jobId).all()).results || [];
+        const batches = (await env.DB.prepare(
+          `SELECT r.id, r.destination, r.supplier, r.created_at, r.tech_id,
+                  COALESCE(t.name, 'Office') AS who
+             FROM crm_inventory_returns r
+             LEFT JOIN crm_techs t ON t.st_tech_id = r.tech_id
+            WHERE r.job_id = ? ORDER BY r.id DESC`
+        ).bind(jobId).all()).results || [];
+        // Attach each stock-return batch's reversed material lines (parse [batch N]).
+        const relLines = (await env.DB.prepare(
+          `SELECT jm.notes, m.name, jm.quantity
+             FROM crm_job_materials jm JOIN crm_materials m ON m.id = jm.material_id
+            WHERE jm.job_id = ? AND jm.notes LIKE 'return of line #%'`
+        ).bind(jobId).all()).results || [];
+        const byBatch = {};
+        for (const ln of relLines) {
+          const mm = /\[batch (\d+)\]/.exec(ln.notes || "");
+          if (!mm) continue;
+          (byBatch[mm[1]] ??= []).push({ name: ln.name, qty: Math.abs(Number(ln.quantity) || 0) });
+        }
+        const stock_returns = batches.map((bt) => ({ ...bt, items: byBatch[bt.id] || [] }));
+        return json({ job_id: jobId, credits, stock_returns });
       }
 
       // --- 4h-i. Returns · Branch A: supplier/box-store CREDIT slip against a job.

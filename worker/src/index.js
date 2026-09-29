@@ -1965,7 +1965,7 @@ Schema: {"source_type":"unknown","supplier":"","items":[{"description":"","quant
           `INSERT INTO crm_job_purchases
              (job_id, job_number, supplier, receipt_total, description, tech_id, is_overhead, source, doc_only, is_return, created_at)
            VALUES (?,?,?,?,?,?,0,'tech',0,1, datetime('now'))`
-        ).bind(jobId, b.job_number ?? String(jobId), supplier, credit, b.description ?? "supplier credit", b.tech_id ?? null).run();
+        ).bind(jobId, b.job_number ?? String(jobId), supplier, credit, b.description ?? "supplier credit", b.tech_id ?? 0).run();  // tech_id NOT NULL; token fills it in the app, 0 = unattributed fallback
         const pid = ins.meta?.last_row_id ?? null;
         if (pid && b.image_base64 && env.RECEIPTS) {
           try {

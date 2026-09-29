@@ -832,6 +832,41 @@ export default {
         return json({ st_tech_id: tid, date: dayStr, jobs, recent, fallback: jobs.length ? null : "manual" });
       }
 
+      // --- 0b-bis. A tech's RECENT jobs over a wide window (for the returns job
+      // picker). Returns usually happen days/weeks after the job, so today's list
+      // is the wrong set. Same tech-scoped appointment-assignment join as 0b, but a
+      // 30–90 day window (default 60), any non-Canceled status, newest-first.
+      // GET /api/techs/recent-jobs?st_tech_id=&days=60
+      if (p === "/api/techs/recent-jobs" && request.method === "GET") {
+        const tid = parseInt(url.searchParams.get("st_tech_id") || "", 10);
+        if (!tid) return json({ jobs: [] });
+        const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "60", 10) || 60, 1), 90);
+        const since = new Date(Date.now() - days * 86400000).toISOString().replace(/\.\d{3}Z$/, "Z");
+        const addr =
+          `TRIM(COALESCE(l.address_street, c.address_street, '') ||
+                CASE WHEN COALESCE(l.address_city, c.address_city) IS NOT NULL THEN ', ' || COALESCE(l.address_city, c.address_city) ELSE '' END)`;
+        const rows = (await env.DB.prepare(
+          `SELECT aa.job_id, j.job_number, j.status AS job_status, c.name AS customer,
+                  ${addr} AS address, l.name AS location_name,
+                  MAX(ap.start_date) AS start_date
+             FROM crm_st_appointment_assignments aa
+             JOIN crm_st_appointments ap ON ap.id = aa.appointment_id
+             JOIN crm_st_jobs j           ON j.id = aa.job_id
+             LEFT JOIN crm_st_locations l ON l.id = j.location_id
+             LEFT JOIN crm_st_customers c ON c.id = j.customer_id
+            WHERE aa.technician_id = ?1
+              AND j.status != 'Canceled'
+              AND ap.start_date >= ?2
+            GROUP BY aa.job_id, j.job_number, j.status, c.name, l.address_street, l.address_city, l.name, c.address_street, c.address_city
+            ORDER BY start_date DESC
+            LIMIT 200`
+        ).bind(tid, since).all()).results || [];
+        return json({ st_tech_id: tid, days, jobs: rows.map((r) => ({
+          job_id: r.job_id, job_number: r.job_number, customer: r.customer,
+          address: r.address || null, status: r.job_status, start_date: r.start_date,
+        })) });
+      }
+
       // --- 0c. Van roster for the office UI -------------------------------
       // Active truck locations with their assigned tech's name, plus a count of
       // materials below par (on_hand < min_qty) for the restock badge. The tech

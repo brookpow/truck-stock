@@ -9,6 +9,8 @@ import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, rem
 import { C, FONT, DISP, SHADOW, BADGE } from "./theme.js";
 
 const fmt = (n) => "$" + (Number(n) || 0).toFixed(2);
+// A credit / returned line renders as (−$X) — never "$-X".
+const creditFmt = (n) => `(−${fmt(Math.abs(Number(n) || 0))})`;
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100; // round to cents
 const TAX_RATE = 0.12; // PST + GST
 // Matched receipt lines carry this in notes; they show under "Receipts", NOT in
@@ -777,7 +779,16 @@ function Capture({ tech, job, onBack }) {
         </div>
       ))}
 
-      {items.map((it) => (
+      {items.map((it) => ((it.notes || "").startsWith("return of line #") || (Number(it.quantity) || 0) < 0) ? (
+        // Return line (stock returned off this job) — READ-ONLY. Editing/deleting it
+        // here would undo the cost reversal without undoing its stock movement.
+        <div key={it.id} style={styles.loggedRow}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div style={styles.ellip}>{it.name || ("Material #" + it.material_id)}<span style={styles.creditTag}>RETURNED</span></div>
+            <div style={styles.muted}>↩ returned {Math.abs(Number(it.quantity) || 0)} · {fmt(it.unit_cost)} each · <span style={styles.creditAmt}>{creditFmt(it.total_cost)}</span></div>
+          </div>
+        </div>
+      ) : (
         <div key={it.id} style={styles.loggedRow}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div style={styles.ellip}>{it.name || ("Material #" + it.material_id)}{(it.use_unit && it.use_unit !== "each") ? <span style={styles.ftTag}> · {it.use_unit}</span> : null}</div>
@@ -861,7 +872,7 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
   const [creditAmt, setCreditAmt] = useState(String(Math.abs(Number(purchase.receipt_total) || 0)));
 
   async function del() {
-    if (!confirm(`Delete this receipt (${purchase.supplier} · ${fmt(purchase.receipt_total)})?\nRemoves it and any matched lines it logged. No van stock changes.`)) return;
+    if (!confirm(`Delete this ${isReturn ? "credit" : "receipt"} (${purchase.supplier} · ${isReturn ? creditFmt(purchase.receipt_total) : fmt(purchase.receipt_total)})?\nRemoves it and any matched lines it logged. No van stock changes.`)) return;
     setBusy(true);
     try { await deletePurchase(jobId, purchase.id); onChanged(); }
     catch (e) { alert("Delete failed: " + (e.message || e)); setBusy(false); }
@@ -884,7 +895,7 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
         <button style={styles.receiptToggle} onClick={() => setOpen((o) => !o)}>
           <span style={styles.ellip}>{purchase.supplier || "Receipt"}</span>
           <span style={styles.muted}>
-            {fmt(purchase.receipt_total)} · {lines.length} item{lines.length === 1 ? "" : "s"} {open ? "▾" : "▸"}
+            {isReturn ? <><span style={styles.creditAmt}>{creditFmt(purchase.receipt_total)}</span><span style={styles.creditTag}>CREDIT</span></> : fmt(purchase.receipt_total)} · {lines.length} item{lines.length === 1 ? "" : "s"} {open ? "▾" : "▸"}
           </span>
         </button>
         <button style={styles.editBtnSm} disabled={busy} onClick={() => setEditing((e) => !e)}>edit</button>
@@ -893,11 +904,11 @@ function ReceiptRow({ jobId, purchase, onChanged }) {
 
       {open && !editing && (
         <div style={styles.receiptBody}>
-          <div style={styles.muted}>Subtotal {fmt(purchase.subtotal)} · Tax {fmt(purchase.tax)} · Total {fmt(purchase.receipt_total)}</div>
+          <div style={styles.muted}>{isReturn ? <>Supplier credit · <span style={styles.creditAmt}>{creditFmt(purchase.receipt_total)}</span></> : <>Subtotal {fmt(purchase.subtotal)} · Tax {fmt(purchase.tax)} · Total {fmt(purchase.receipt_total)}</>}</div>
           {lines.map((ln) => (
             <div key={ln.line_id} style={styles.muted}>· {ln.material || ("#" + ln.material_id)} ×{ln.quantity} ({fmt(ln.total_cost)})</div>
           ))}
-          {lines.length === 0 && <div style={styles.muted}>· no matched catalog lines</div>}
+          {lines.length === 0 && !isReturn && <div style={styles.muted}>· no matched catalog lines</div>}
           {purchase.has_photo ? (
             <a href={receiptPhotoUrl(purchase.id)} target="_blank" rel="noreferrer">
               <img src={receiptPhotoUrl(purchase.id)} alt="receipt" style={styles.thumb} />
@@ -1820,6 +1831,8 @@ const styles = {
   primary: { width: "100%", height: 52, fontSize: 16, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer" },
   scanBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
   returnBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.redInk, border: `1px solid ${C.red}`, background: C.redWash, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
+  creditTag: { marginLeft: 6, fontSize: 10, fontWeight: 700, letterSpacing: 0.4, color: C.redInk, background: C.redWash, borderRadius: 6, padding: "2px 7px", verticalAlign: "middle" },
+  creditAmt: { color: C.redInk, fontWeight: 700 },
   guardNote: { fontSize: 13, color: C.amberInk, background: C.amberWash, border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 12px", margin: "6px 0 12px" },
   discNote: { fontSize: 12, fontWeight: 700, color: C.amberInk },
   unmatchedBox: { border: `1px dashed ${C.hair}`, borderRadius: 12, padding: "10px 12px", margin: "10px 0" },

@@ -1010,6 +1010,8 @@ function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
   const [err, setErr] = useState(null);
   const [imgB64, setImgB64] = useState(null);
   const [imgMedia, setImgMedia] = useState("image/jpeg");
+  const [scanning, setScanning] = useState(false);   // vision read in flight
+  // Plain photo attach (no scan) — used for the supplier-return credit-slip slot.
   async function onPhoto(e) {
     const f = e.target.files?.[0]; if (!f) return;
     try { const { base64, mediaType } = await fileToScaledBase64(f); setImgB64(base64); setImgMedia(mediaType); }
@@ -1017,9 +1019,37 @@ function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
     e.target.value = "";
   }
 
+  // Returnable = this job's positive, non-return lines. `remaining` = logged qty
+  // − already-returned (prior return lines reference the original id in notes), so
+  // the cap and the "M returnable" note reflect earlier returns. Fully-returned drop off.
+  const returnedByLine = {};
+  for (const it of (items || [])) {
+    const m = (it.notes || "").match(/^return of line #(\d+)/);
+    if (m) returnedByLine[m[1]] = (returnedByLine[m[1]] || 0) + Math.abs(Number(it.quantity) || 0);
+  }
+  const returnable = (items || [])
+    .filter((it) => (Number(it.quantity) || 0) > 0 && !(it.notes || "").startsWith("return of line #"))
+    .map((it) => ({ ...it, remaining: Math.max(0, (Number(it.quantity) || 0) - (returnedByLine[it.id] || 0)) }))
+    .filter((it) => it.remaining > 0);
+
   // Branch A — credit slip
   const [supplier, setSupplier] = useState("");
   const [amount, setAmount] = useState("");
+  // Photograph the credit slip AND read it to pre-fill supplier + amount (tech
+  // confirms the amount before submit). Scan is additive — a failure keeps the photo.
+  async function onCreditPhoto(e) {
+    const f = e.target.files?.[0]; if (!f) return;
+    setErr(null);
+    let cap; try { cap = await fileToScaledBase64(f); } catch (ex) { setErr(String(ex.message || ex)); e.target.value = ""; return; }
+    setImgB64(cap.base64); setImgMedia(cap.mediaType);
+    setScanning(true);
+    try {
+      const res = await scanReceipt(job.id, cap.base64, cap.mediaType);
+      if (res.supplier && !supplier.trim()) setSupplier(res.supplier);
+      if (Number(res.total) > 0) setAmount(String(res.total));
+    } catch { /* additive — keep the photo; tech types the fields */ }
+    finally { setScanning(false); e.target.value = ""; }
+  }
   async function submitCredit() {
     setErr(null);
     if (!supplier.trim()) { setErr("Supplier is required."); return; }
@@ -1031,13 +1061,47 @@ function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
     } catch (ex) { setErr(String(ex.message || ex)); setBusy(false); }
   }
 
-  // Branch B — truck stock (pick from THIS job's logged, positive, non-return lines)
-  const returnable = (items || []).filter((it) => (it.quantity || 0) > 0 && !(it.notes || "").startsWith("return of line #"));
+  // Branch B — truck stock
   const [qty, setQty] = useState({});
   const [destination, setDestination] = useState(null);   // 'shop' | 'supplier'
   const [stockSupplier, setStockSupplier] = useState("");
+  const [unmatched, setUnmatched] = useState([]);          // scanned slip lines with no job-line match
+  const [discrepancies, setDiscrepancies] = useState({});  // lineId -> { slip, returnable }
+  const [scanNote, setScanNote] = useState(null);
   const picked = returnable.map((it) => ({ it, q: Number(qty[it.id] || 0) })).filter((x) => x.q > 0);
-  const bump = (it, d) => setQty((s) => ({ ...s, [it.id]: Math.max(0, Math.min(it.quantity, (Number(s[it.id]) || 0) + d)) }));
+  const bump = (it, d) => setQty((s) => ({ ...s, [it.id]: Math.max(0, Math.min(it.remaining, (Number(s[it.id]) || 0) + d)) }));
+
+  // Scan the packing slip: match each slip line's catalog material_id (from the
+  // scanner) to THIS job's logged lines — id-intersection only, no name guessing.
+  // Pre-fill at capped remaining; flag slip-qty > returnable so an unlogged /
+  // wrong-job signal isn't hidden. Pre-fill ONLY — tech adjusts + confirms below.
+  async function onScanSlip(e) {
+    const f = e.target.files?.[0]; if (!f) return;
+    setErr(null); setScanNote(null); setUnmatched([]); setDiscrepancies({});
+    let cap; try { cap = await fileToScaledBase64(f); } catch (ex) { setErr(String(ex.message || ex)); e.target.value = ""; return; }
+    setImgB64(cap.base64); setImgMedia(cap.mediaType);   // the scanned slip IS the batch photo
+    setScanning(true);
+    try {
+      const res = await scanReceipt(job.id, cap.base64, cap.mediaType);
+      const byMat = {};
+      for (const it of returnable) byMat[it.material_id] = it;   // job lines keyed by material
+      const nextQty = { ...qty }, um = [], disc = {};
+      let matched = 0;
+      for (const line of (res.items || [])) {
+        const mid = line.match?.id;                              // scanner's catalog match
+        const target = mid != null ? byMat[mid] : null;          // ∩ this job's logged lines
+        if (!target) { um.push({ description: line.description || "(unnamed)", quantity: Number(line.quantity) || 1 }); continue; }
+        matched++;
+        const slipQty = Number(line.quantity) || 1;
+        nextQty[target.id] = Math.max(Number(nextQty[target.id]) || 0, Math.min(slipQty, target.remaining));
+        if (slipQty > target.remaining) disc[target.id] = { slip: slipQty, returnable: target.remaining };
+      }
+      setQty(nextQty); setUnmatched(um); setDiscrepancies(disc);
+      setScanNote(`Scanned — ${matched} line${matched === 1 ? "" : "s"} matched${um.length ? `, ${um.length} not matched` : ""}. Check quantities, then confirm.`);
+    } catch (ex) {
+      setErr("Couldn't read the slip — pick items manually. (" + String(ex.message || ex) + ")");
+    } finally { setScanning(false); e.target.value = ""; }
+  }
   async function submitStock() {
     setErr(null);
     if (!picked.length) { setErr("Pick at least one item and quantity."); return; }
@@ -1048,7 +1112,7 @@ function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
         destination,
         supplier: destination === "supplier" ? (stockSupplier.trim() || undefined) : undefined,
         tech_id: tech.st_tech_id,
-        image_base64: destination === "supplier" ? (imgB64 || undefined) : undefined,
+        image_base64: imgB64 || undefined,   // the scanned/attached slip becomes the batch photo
         media_type: imgMedia,
         lines: picked.map((x) => ({ material_line_id: x.it.id, qty: x.q })),
       });
@@ -1063,6 +1127,7 @@ function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
         <span style={styles.who}>Return items</span>
       </div>
       {err && <div style={styles.error}>{err}</div>}
+      {scanning && <div style={styles.note}>📷 Reading the slip…</div>}
 
       {phase === "branch" && (<>
         <p style={styles.sub}>What are you returning for {job.cust || job.num}?</p>
@@ -1078,29 +1143,44 @@ function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
 
       {phase === "credit" && (<>
         <div style={styles.guardNote}>Truck stock physically returned to a supplier goes through <b>Return truck stock</b> — don't scan the credit here (it would double-count).</div>
+        <label style={styles.scanBtn}>{imgB64 ? "✓ credit slip scanned — retake" : "📷 Scan the credit slip (fills supplier + amount)"}
+          <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onCreditPhoto} /></label>
         <label style={styles.fieldLbl}>Supplier</label>
         <input style={styles.input} value={supplier} onChange={(e) => setSupplier(e.target.value)} placeholder="e.g. EMCO, Home Depot" />
         <label style={styles.fieldLbl}>Credit amount (what they gave back)</label>
         <input style={styles.input} inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
-        <label style={styles.scanBtn}>{imgB64 ? "✓ credit slip attached — retake" : "📷 Photograph the credit slip"}
-          <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onPhoto} /></label>
-        <button style={styles.primary} disabled={busy} onClick={submitCredit}>{busy ? "Saving…" : `Record credit −${fmt(amount || 0)}`}</button>
+        <button style={styles.primary} disabled={busy || scanning} onClick={submitCredit}>{busy ? "Saving…" : `Record credit −${fmt(amount || 0)}`}</button>
       </>)}
 
       {phase === "stock" && (returnable.length === 0 ? (
         <p style={styles.sub}>No returnable materials are logged to this job.</p>
       ) : (<>
-        <p style={styles.sub}>Pick items to return (max = qty logged to this job):</p>
-        {returnable.map((it) => (
-          <div key={it.id} style={styles.retRow}>
-            <span style={styles.retName}>{it.name}<br /><span style={styles.muted}>{it.quantity} logged · {fmt(it.unit_cost)} ea</span></span>
-            <span style={styles.qtyStep}>
-              <button style={styles.stepBtn} onClick={() => bump(it, -1)}>−</button>
-              <span style={styles.qtyVal}>{Number(qty[it.id]) || 0}</span>
-              <button style={styles.stepBtn} onClick={() => bump(it, 1)}>+</button>
-            </span>
+        <label style={styles.scanBtn}>📷 Scan packing slip (pre-fills the list)
+          <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onScanSlip} /></label>
+        {scanNote && <div style={styles.note}>{scanNote}</div>}
+        <p style={styles.sub}>Pick items to return (max = qty still returnable on this job):</p>
+        {returnable.map((it) => {
+          const d = discrepancies[it.id];
+          return (
+            <div key={it.id} style={styles.retRow}>
+              <span style={styles.retName}>{it.name}<br />
+                <span style={styles.muted}>{it.quantity} logged{it.remaining < it.quantity ? ` · ${it.remaining} returnable` : ""} · {fmt(it.unit_cost)} ea</span>
+                {d && <span style={styles.discNote}><br />⚠ slip shows {d.slip} · {d.returnable} returnable on this job</span>}
+              </span>
+              <span style={styles.qtyStep}>
+                <button style={styles.stepBtn} onClick={() => bump(it, -1)}>−</button>
+                <span style={styles.qtyVal}>{Number(qty[it.id]) || 0}</span>
+                <button style={styles.stepBtn} onClick={() => bump(it, 1)}>+</button>
+              </span>
+            </div>
+          );
+        })}
+        {unmatched.length > 0 && (
+          <div style={styles.unmatchedBox}>
+            <div style={styles.fieldLbl}>Not matched — pick manually if needed</div>
+            {unmatched.map((u, i) => <div key={i} style={styles.muted}>· {u.description} ×{u.quantity}</div>)}
           </div>
-        ))}
+        )}
         <div style={styles.destRow}>
           <button style={destination === "shop" ? styles.destOn : styles.destOff} onClick={() => setDestination("shop")}>Back to shop</button>
           <button style={destination === "supplier" ? styles.destOn : styles.destOff} onClick={() => setDestination("supplier")}>Back to supplier</button>
@@ -1109,10 +1189,11 @@ function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
         {destination === "supplier" && (<>
           <label style={styles.fieldLbl}>Supplier (optional)</label>
           <input style={styles.input} value={stockSupplier} onChange={(e) => setStockSupplier(e.target.value)} placeholder="e.g. EMCO" />
-          <label style={styles.scanBtn}>{imgB64 ? "✓ credit slip attached — retake" : "📷 Photograph the credit slip (optional)"}
-            <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onPhoto} /></label>
+          {!imgB64 && <label style={styles.scanBtn}>📷 Photograph the credit slip (optional)
+            <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onPhoto} /></label>}
+          {imgB64 && <div style={styles.muted}>✓ slip photo attached to this return</div>}
         </>)}
-        <button style={styles.primary} disabled={busy || !picked.length || !destination} onClick={submitStock}>
+        <button style={styles.primary} disabled={busy || scanning || !picked.length || !destination} onClick={submitStock}>
           {busy ? "Saving…" : `Return ${picked.reduce((a, x) => a + x.q, 0)} item${picked.reduce((a, x) => a + x.q, 0) === 1 ? "" : "s"}`}
         </button>
       </>))}
@@ -1729,6 +1810,8 @@ const styles = {
   scanBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
   returnBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.redInk, border: `1px solid ${C.red}`, background: C.redWash, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
   guardNote: { fontSize: 13, color: C.amberInk, background: C.amberWash, border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 12px", margin: "6px 0 12px" },
+  discNote: { fontSize: 12, fontWeight: 700, color: C.amberInk },
+  unmatchedBox: { border: `1px dashed ${C.hair}`, borderRadius: 12, padding: "10px 12px", margin: "10px 0" },
   jobPickRow: { ...card, display: "flex", flexDirection: "column", gap: 3, width: "100%", boxSizing: "border-box", textAlign: "left", cursor: "pointer", padding: "13px 15px", borderRadius: 14, border: `1px solid ${C.hair}`, marginBottom: 9 },
   jobPickTitle: { fontWeight: 700, fontSize: 15, color: C.ink },
   fieldLbl: { display: "block", fontSize: 13, fontWeight: 700, color: C.ink2, margin: "6px 0 4px" },

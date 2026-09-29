@@ -842,6 +842,7 @@ export default {
         if (!tid) return json({ jobs: [] });
         const days = Math.min(Math.max(parseInt(url.searchParams.get("days") || "60", 10) || 60, 1), 90);
         const since = new Date(Date.now() - days * 86400000).toISOString().replace(/\.\d{3}Z$/, "Z");
+        const nowTs = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");   // cap at now — a return can't come from a job that hasn't happened
         const addr =
           `TRIM(COALESCE(l.address_street, c.address_street, '') ||
                 CASE WHEN COALESCE(l.address_city, c.address_city) IS NOT NULL THEN ', ' || COALESCE(l.address_city, c.address_city) ELSE '' END)`;
@@ -856,11 +857,11 @@ export default {
              LEFT JOIN crm_st_customers c ON c.id = j.customer_id
             WHERE aa.technician_id = ?1
               AND j.status != 'Canceled'
-              AND ap.start_date >= ?2
+              AND ap.start_date >= ?2 AND ap.start_date <= ?3
             GROUP BY aa.job_id, j.job_number, j.status, c.name, l.address_street, l.address_city, l.name, c.address_street, c.address_city
             ORDER BY start_date DESC
             LIMIT 200`
-        ).bind(tid, since).all()).results || [];
+        ).bind(tid, since, nowTs).all()).results || [];
         return json({ st_tech_id: tid, days, jobs: rows.map((r) => ({
           job_id: r.job_id, job_number: r.job_number, customer: r.customer,
           address: r.address || null, status: r.job_status, start_date: r.start_date,

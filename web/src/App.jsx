@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { getTechs, getTodaysJobs, searchMaterials, getJobMaterials, deleteMaterial, patchMaterialQty,
   scanReceipt, savePurchase, saveOverheadPurchase, restockFromShop, getJobPurchases, deletePurchase, patchPurchase,
   getByCategory, createRequest, receiptPhotoUrl, createRestockRequest, getRestockRequests, dismissRestockRequest,
+  returnCredit, returnStock,
   startCount, getCurrentCount, saveCountItems, finishCount, discardCount,
   techList, techLogin, getTechToken, setTechToken, setOnAuthLost } from "./api";
 import { logMaterialResilient, flushQueue, pendingCount, pendingItemsForJob, removeFromQueue, startAutoFlush } from "./syncQueue";
@@ -429,6 +430,7 @@ function Capture({ tech, job, onBack }) {
   const [pendingItems, setPendingItems] = useState([]);         // this job's queued saves
   const [note, setNote] = useState("");                          // transient status note
   const [showReceipt, setShowReceipt] = useState(false);         // receipt-scan sub-screen
+  const [showReturns, setShowReturns] = useState(false);         // returns sub-screen (credit slip / truck stock)
   const [purchases, setPurchases] = useState([]);                // saved receipts on this job
   const [categories, setCategories] = useState([]);              // catalog grouped, for browse
   const [openCat, setOpenCat] = useState(null);                  // one category open at a time
@@ -630,6 +632,12 @@ function Capture({ tech, job, onBack }) {
     );
   }
 
+  if (showReturns) {
+    return <ReturnsFlow tech={tech} job={job} items={items}
+      onCancel={() => setShowReturns(false)}
+      onDone={(msg) => { setShowReturns(false); refresh(); flashNote(msg); }} />;
+  }
+
   return (
     <div style={styles.screen}>
       <div style={styles.topbar}>
@@ -660,6 +668,9 @@ function Capture({ tech, job, onBack }) {
 
       <button style={styles.scanBtn} onClick={() => setShowReceipt(true)}>
         📷 Scan a receipt (supplier purchase — not off the van)
+      </button>
+      <button style={styles.returnBtn} onClick={() => setShowReturns(true)}>
+        ↩ Return items (supplier credit or truck stock)
       </button>
 
       {results.map((m) => (
@@ -911,6 +922,126 @@ function fileToScaledBase64(file, maxDim = 1600, quality = 0.92) {
     };
     reader.readAsDataURL(file);
   });
+}
+
+// ---- Returns: supplier credit slip (Branch A) OR truck stock (Branch B) ------
+// Per-job. Branch A writes a negative purchase (credit); Branch B reverses the
+// job's material cost at the ORIGINAL unit_cost and moves stock (shop) or notes
+// the disposition (supplier). Originals are never edited.
+function ReturnsFlow({ tech, job, items, onCancel, onDone }) {
+  const [phase, setPhase] = useState("branch");   // branch | credit | stock
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [imgB64, setImgB64] = useState(null);
+  const [imgMedia, setImgMedia] = useState("image/jpeg");
+  async function onPhoto(e) {
+    const f = e.target.files?.[0]; if (!f) return;
+    try { const { base64, mediaType } = await fileToScaledBase64(f); setImgB64(base64); setImgMedia(mediaType); }
+    catch (ex) { setErr(String(ex.message || ex)); }
+    e.target.value = "";
+  }
+
+  // Branch A — credit slip
+  const [supplier, setSupplier] = useState("");
+  const [amount, setAmount] = useState("");
+  async function submitCredit() {
+    setErr(null);
+    if (!supplier.trim()) { setErr("Supplier is required."); return; }
+    if (!(Number(amount) > 0)) { setErr("Enter the credit amount (a positive number)."); return; }
+    setBusy(true);
+    try {
+      await returnCredit(job.id, { supplier: supplier.trim(), amount: Number(amount), tech_id: tech.st_tech_id, image_base64: imgB64 || undefined, media_type: imgMedia });
+      onDone(`Credit −${fmt(amount)} recorded on this job`);
+    } catch (ex) { setErr(String(ex.message || ex)); setBusy(false); }
+  }
+
+  // Branch B — truck stock (pick from THIS job's logged, positive, non-return lines)
+  const returnable = (items || []).filter((it) => (it.quantity || 0) > 0 && !(it.notes || "").startsWith("return of line #"));
+  const [qty, setQty] = useState({});
+  const [destination, setDestination] = useState(null);   // 'shop' | 'supplier'
+  const [stockSupplier, setStockSupplier] = useState("");
+  const picked = returnable.map((it) => ({ it, q: Number(qty[it.id] || 0) })).filter((x) => x.q > 0);
+  const bump = (it, d) => setQty((s) => ({ ...s, [it.id]: Math.max(0, Math.min(it.quantity, (Number(s[it.id]) || 0) + d)) }));
+  async function submitStock() {
+    setErr(null);
+    if (!picked.length) { setErr("Pick at least one item and quantity."); return; }
+    if (!destination) { setErr("Choose where the stock goes."); return; }
+    setBusy(true);
+    try {
+      await returnStock(job.id, {
+        destination,
+        supplier: destination === "supplier" ? (stockSupplier.trim() || undefined) : undefined,
+        tech_id: tech.st_tech_id,
+        image_base64: destination === "supplier" ? (imgB64 || undefined) : undefined,
+        media_type: imgMedia,
+        lines: picked.map((x) => ({ material_line_id: x.it.id, qty: x.q })),
+      });
+      onDone(destination === "shop" ? "Returned to shop stock" : "Returned to supplier · slip saved");
+    } catch (ex) { setErr(String(ex.message || ex)); setBusy(false); }
+  }
+
+  return (
+    <div style={styles.screen}>
+      <div style={styles.topbar}>
+        <button style={styles.linkBtn} onClick={phase === "branch" ? onCancel : () => { setPhase("branch"); setErr(null); }}>← {phase === "branch" ? "back" : "return type"}</button>
+        <span style={styles.who}>Return items</span>
+      </div>
+      {err && <div style={styles.error}>{err}</div>}
+
+      {phase === "branch" && (<>
+        <p style={styles.sub}>What are you returning for {job.cust || job.num}?</p>
+        <button style={styles.actRow} className="fm-press" onClick={() => setPhase("credit")}>
+          <span style={styles.actText}><span style={styles.actTitle}>🧾 Supplier credit slip</span>
+          <span style={styles.actDesc}>Money a supplier/box store credited back on this job</span></span>
+        </button>
+        <button style={styles.actRow} className="fm-press" onClick={() => setPhase("stock")}>
+          <span style={styles.actText}><span style={styles.actTitle}>↩ Return truck stock</span>
+          <span style={styles.actDesc}>Items logged to this job, going back to the shop or a supplier</span></span>
+        </button>
+      </>)}
+
+      {phase === "credit" && (<>
+        <div style={styles.guardNote}>Truck stock physically returned to a supplier goes through <b>Return truck stock</b> — don't scan the credit here (it would double-count).</div>
+        <label style={styles.fieldLbl}>Supplier</label>
+        <input style={styles.input} value={supplier} onChange={(e) => setSupplier(e.target.value)} placeholder="e.g. EMCO, Home Depot" />
+        <label style={styles.fieldLbl}>Credit amount (what they gave back)</label>
+        <input style={styles.input} inputMode="decimal" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0.00" />
+        <label style={styles.scanBtn}>{imgB64 ? "✓ credit slip attached — retake" : "📷 Photograph the credit slip"}
+          <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onPhoto} /></label>
+        <button style={styles.primary} disabled={busy} onClick={submitCredit}>{busy ? "Saving…" : `Record credit −${fmt(amount || 0)}`}</button>
+      </>)}
+
+      {phase === "stock" && (returnable.length === 0 ? (
+        <p style={styles.sub}>No returnable materials are logged to this job.</p>
+      ) : (<>
+        <p style={styles.sub}>Pick items to return (max = qty logged to this job):</p>
+        {returnable.map((it) => (
+          <div key={it.id} style={styles.retRow}>
+            <span style={styles.retName}>{it.name}<br /><span style={styles.muted}>{it.quantity} logged · {fmt(it.unit_cost)} ea</span></span>
+            <span style={styles.qtyStep}>
+              <button style={styles.stepBtn} onClick={() => bump(it, -1)}>−</button>
+              <span style={styles.qtyVal}>{Number(qty[it.id]) || 0}</span>
+              <button style={styles.stepBtn} onClick={() => bump(it, 1)}>+</button>
+            </span>
+          </div>
+        ))}
+        <div style={styles.destRow}>
+          <button style={destination === "shop" ? styles.destOn : styles.destOff} onClick={() => setDestination("shop")}>Back to shop</button>
+          <button style={destination === "supplier" ? styles.destOn : styles.destOff} onClick={() => setDestination("supplier")}>Back to supplier</button>
+        </div>
+        {destination === "shop" && <div style={styles.guardNote}>Confirm the items are <b>physically at the shop</b> — this puts them back into shop stock.</div>}
+        {destination === "supplier" && (<>
+          <label style={styles.fieldLbl}>Supplier (optional)</label>
+          <input style={styles.input} value={stockSupplier} onChange={(e) => setStockSupplier(e.target.value)} placeholder="e.g. EMCO" />
+          <label style={styles.scanBtn}>{imgB64 ? "✓ credit slip attached — retake" : "📷 Photograph the credit slip (optional)"}
+            <input type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={onPhoto} /></label>
+        </>)}
+        <button style={styles.primary} disabled={busy || !picked.length || !destination} onClick={submitStock}>
+          {busy ? "Saving…" : `Return ${picked.reduce((a, x) => a + x.q, 0)} item${picked.reduce((a, x) => a + x.q, 0) === 1 ? "" : "s"}`}
+        </button>
+      </>))}
+    </div>
+  );
 }
 
 // ---- Receipt scanner: capture -> vision -> review/confirm -> purchases ------
@@ -1520,6 +1651,17 @@ const styles = {
   input: { ...ctl, width: "100%", height: 52, fontSize: 16, padding: "0 14px", marginBottom: 10 },
   primary: { width: "100%", height: 52, fontSize: 16, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer" },
   scanBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
+  returnBtn: { ...card, display: "block", width: "100%", boxSizing: "border-box", height: 50, fontSize: 15, fontWeight: 600, color: C.redInk, border: `1px solid ${C.red}`, background: C.redWash, borderRadius: 14, cursor: "pointer", marginBottom: 12, textAlign: "center" },
+  guardNote: { fontSize: 13, color: C.amberInk, background: C.amberWash, border: `1px solid ${C.amber}`, borderRadius: 12, padding: "10px 12px", margin: "6px 0 12px" },
+  fieldLbl: { display: "block", fontSize: 13, fontWeight: 700, color: C.ink2, margin: "6px 0 4px" },
+  retRow: { display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "10px 0", borderBottom: `1px solid ${C.hair}` },
+  retName: { fontSize: 14, color: C.ink, minWidth: 0 },
+  qtyStep: { display: "flex", alignItems: "center", gap: 10, flex: "none" },
+  stepBtn: { width: 40, height: 40, fontSize: 22, fontWeight: 700, lineHeight: 1, background: C.surface, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 10, cursor: "pointer" },
+  qtyVal: { minWidth: 24, textAlign: "center", fontSize: 17, fontWeight: 700, color: C.ink },
+  destRow: { display: "flex", gap: 10, margin: "14px 0 6px" },
+  destOn: { flex: 1, height: 48, fontSize: 15, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 12, cursor: "pointer" },
+  destOff: { flex: 1, height: 48, fontSize: 15, fontWeight: 600, background: C.surface, color: C.ink, border: `1px solid ${C.hair}`, borderRadius: 12, cursor: "pointer" },
   primarySm: { height: 52, padding: "0 18px", fontSize: 15, fontWeight: 700, background: C.ink, color: "#fff", border: "none", borderRadius: 14, cursor: "pointer", whiteSpace: "nowrap" },
   // Receipt destination doors (chosen after the scan — no silent default).
   destDoor: { ...card, display: "flex", flexDirection: "column", gap: 3, width: "100%", textAlign: "left", cursor: "pointer", padding: "16px", borderRadius: 16, marginBottom: 12, border: `1px solid ${C.hair}` },

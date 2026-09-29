@@ -223,6 +223,28 @@ export async function patchPurchase(jobId, id, body) {
   return d;
 }
 
+// Returns · Branch A: a supplier/box-store CREDIT slip against a job (negative
+// purchase). body: { supplier, amount (positive), image_base64?, media_type? }.
+export async function returnCredit(jobId, body) {
+  const r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}/returns/credit`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("credit " + r.status));
+  return d;
+}
+
+// Returns · Branch B: truck stock returned from a job. body: { destination
+// ('shop'|'supplier'), supplier?, lines:[{material_line_id, qty}], image_base64?, media_type? }.
+export async function returnStock(jobId, body) {
+  const r = await fetch(`${API}/api/jobs/${encodeURIComponent(jobId)}/returns/stock`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || ("return " + r.status));
+  return d;
+}
+
 // Catalog grouped by category for browse -> { categories:[{ name, count, items:[{id,name,cost}] }] }.
 export async function getByCategory() {
   const r = await fetch(`${API}/api/materials/by-category`);
